@@ -3,5 +3,6 @@ torchlpc>=0.2
 numpy
 scipy
 soundfile
+numba            # reference engine (vocaltract.reference); optional but ~100x faster
 pytest
 tqdm

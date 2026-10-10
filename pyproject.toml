@@ -16,6 +16,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "tqdm"]
+reference = ["numba"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

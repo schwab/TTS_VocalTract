@@ -104,6 +104,22 @@ Training uses a combination of:
 3. **Adversarial loss (optional)** — multi-resolution discriminator for perceptual quality
 4. **Parameter reconstruction loss** — when training with a paired encoder/decoder
 
+## Reference Engine
+
+`vocaltract.reference` is a bit-faithful, non-differentiable Python port of the original
+`spin/VocalTract.spin` assembly engine. It uses the same 32-bit integer math, ROM tables,
+CORDIC resonators and frame interpolation. It is the ground truth for what the Propeller
+plays from a frame sequence. `reference/spin.py` holds the shared pieces for porting
+more Spin programs: a .spin CON/DAT parser, Spin's `?rnd`, the VocalTract object API,
+and the render/mix/CLI.
+
+```bash
+pip install numba soundfile    # numba is optional but ~100x faster
+python -m vocaltract.reference.singing_demo_seven         # out/singing_demo_seven.wav (faithful timing)
+python -m vocaltract.reference.singing_demo_seven --sync  # parts in lockstep
+python -m vocaltract.reference.singing_demo               # out/singing_demo.wav (held vowels)
+```
+
 ## Roadmap
 
 - [ ] **Phase 1** — Minimal differentiable LPC pipeline (random audio → params → LPC → reconstruction)
