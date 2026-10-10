@@ -2,7 +2,7 @@
 
 import torch
 
-from vocaltract.filter import LPCFilter
+from vocaltract.filter import LPCFilter, frames_to_samples
 from vocaltract.losses import MultiScaleSTFTLoss
 from vocaltract.mapper import ParamToLPC
 from vocaltract.source import make_excitation
@@ -13,7 +13,7 @@ HOP = 160
 def synthesize(params: torch.Tensor, mapper: ParamToLPC, seed: int = 0) -> torch.Tensor:
     """params (B, T_frames, 13) -> audio (B, T_frames * HOP), with fixed-seed noise."""
     excitation = make_excitation(params, hop=HOP, generator=torch.Generator().manual_seed(seed))
-    coeffs = mapper(params).repeat_interleave(HOP, dim=1)  # frame-rate -> sample-rate
+    coeffs = frames_to_samples(mapper(params), HOP)
     return LPCFilter()(excitation, coeffs)
 
 

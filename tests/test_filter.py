@@ -5,7 +5,7 @@ import pytest
 import torch
 from scipy.signal import lfilter
 
-from vocaltract.filter import HAS_TORCHLPC, LPCFilter, naive_sample_wise_lpc
+from vocaltract.filter import HAS_TORCHLPC, LPCFilter, frames_to_samples, naive_sample_wise_lpc
 from vocaltract.mapper import ParamToLPC
 
 
@@ -149,3 +149,17 @@ class TestAnalyze:
         est = LPCFilter.analyze(audio, order=10, frame_length=250)
         assert est.shape == (2, 4, 10)
         assert not est.requires_grad
+
+
+class TestFramesToSamples:
+    def test_holds_each_frame(self):
+        frames = torch.arange(6.0).reshape(1, 3, 2)
+        samples = frames_to_samples(frames, 4)
+        assert samples.shape == (1, 12, 2)
+        for f in range(3):
+            assert torch.equal(samples[0, 4 * f : 4 * (f + 1)], frames[0, f].expand(4, 2))
+
+    def test_gradient_sums_over_hop(self):
+        frames = torch.randn(2, 5, 3, requires_grad=True)
+        frames_to_samples(frames, 7).sum().backward()
+        assert torch.equal(frames.grad, torch.full_like(frames, 7.0))

@@ -73,6 +73,24 @@ def naive_sample_wise_lpc(excitation: torch.Tensor, coeffs: torch.Tensor) -> tor
     return torch.stack(outputs, dim=-1)
 
 
+def frames_to_samples(coeffs: torch.Tensor, hop: int) -> torch.Tensor:
+    """
+    Hold frame-rate LPC coefficients constant across each frame's samples.
+
+    Direct-form LPC coefficients are *not* interpolated: a linear blend of two
+    stable coefficient sets can have poles outside the unit circle. Holding
+    each frame keeps every sample on a set the mapper guarantees is stable.
+
+    Args:
+        coeffs: Frame-rate coefficients of shape (B, T_frames, order).
+        hop: Samples per frame.
+
+    Returns:
+        Sample-rate coefficients of shape (B, T_frames * hop, order).
+    """
+    return coeffs.repeat_interleave(hop, dim=1)
+
+
 class LPCFilter(nn.Module):
     """
     Time-varying all-pole LPC synthesis filter.
