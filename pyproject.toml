@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vocaltract"
+version = "0.1.0"
+description = "Differentiable, LPC-based neural vocoder inspired by the Parallax Propeller VocalTract"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1",
+    "numpy",
+    "scipy",
+    "soundfile",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "tqdm"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

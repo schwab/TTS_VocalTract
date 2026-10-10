@@ -73,35 +73,46 @@ TTS_VocalTract/
 
 **File:** `src/vocaltract/params.py`
 
-**Goal:** Establish the canonical 13-parameter frame as a documented, typed structure.
+**Goal:** Establish the canonical 13-parameter frame as a documented, typed structure, reconciled against the original Propeller VocalTract.spin source code.
 
 **Specification:**
-- Define a dataclass `VocalParams` with 13 named fields.
-- Fields (adjust names to match the original Propeller VocalTract if you have the source; these are the working names):
+- Define a dataclass `VocalParams` with 13 named fields matching the original VocalTract encoding.
+- The original VocalTract uses byte-range parameters (0..255 for amplitudes, discrete units for frequencies). For differentiable training, we normalize to [0,1] range.
 
-| Index | Name | Range | Meaning |
-|---|---|---|---|
-| 0 | `aspiration` | [0, 1] | Breathiness / noise amplitude |
-| 1 | `glottal_amp` | [0, 1] | Voicing amplitude |
-| 2 | `glottal_pitch` | [0, 1] | Normalized F0 (maps to 50–400 Hz) |
-| 3 | `f1` | [0, 1] | Formant 1 (maps to 200–1000 Hz) |
-| 4 | `f2` | [0, 1] | Formant 2 (maps to 700–2500 Hz) |
-| 5 | `f3` | [0, 1] | Formant 3 (maps to 2000–3500 Hz) |
-| 6 | `f4` | [0, 1] | Formant 4 (maps to 3000–4500 Hz) |
-| 7 | `b1` | [0, 1] | Formant 1 bandwidth |
-| 8 | `b2` | [0, 1] | Formant 2 bandwidth |
-| 9 | `b3` | [0, 1] | Formant 3 bandwidth |
-| 10 | `fricative` | [0, 1] | Fricative noise amplitude |
-| 11 | `nasal` | [0, 1] | Nasal anti-resonator depth |
-| 12 | `reserved` | [0, 1] | Spare / tilt |
+| Index | Name | Original Unit | Normalized Range | Meaning |
+|---|---|---|---|---|
+| 0 | `aa` | 0..255 | [0, 1] | Aspiration amplitude (breath volume: silent..loud, linear) |
+| 1 | `ga` | 0..255 | [0, 1] | Glottal amplitude (voice volume: silent..loud, linear) |
+| 2 | `gp` | 1/48 octave | [0, 1] | Glottal pitch (100 ≡ 110.00Hz, musical note A2) |
+| 3 | `vp` | 1/48 octave | [0, 1] | Vibrato pitch (48 ≡ ± 1/2 octave swing) |
+| 4 | `vr` | 0.0763 Hz | [0, 1] | Vibrato rate (52 ≡ 4 Hz) |
+| 5 | `f1` | 19.53 Hz | [0, 1] | Formant 1 frequency (40 ≡ 781 Hz) |
+| 6 | `f2` | 19.53 Hz | [0, 1] | Formant 2 frequency (56 ≡ 1094 Hz) |
+| 7 | `f3` | 19.53 Hz | [0, 1] | Formant 3 frequency (128 ≡ 2500 Hz) |
+| 8 | `f4` | 19.53 Hz | [0, 1] | Formant 4 frequency (179 ≡ 3496 Hz) |
+| 9 | `na` | 0..255 | [0, 1] | Nasal amplitude (anti-resonator level: off..on, linear) |
+| 10 | `nf` | 19.53 Hz | [0, 1] | Nasal frequency (anti-resonator frequency: 102 ≡ 1992 Hz) |
+| 11 | `fa` | 0..255 | [0, 1] | Frication amplitude (white noise volume: silent..loud, linear) |
+| 12 | `ff` | 39.06 Hz | [0, 1] | Frication frequency (60 ≡ 2344 Hz, "Sh" sound) |
 
 - Provide `PARAM_NAMES: list[str]` and `PARAM_DIM = 13`.
-- Provide `denormalize(params: Tensor) -> dict[str, Tensor]` converting [0,1] values to physical units.
-- Document that the schema is provisional and will be reconciled with the original VocalTract encoding in a later phase.
+- Provide `denormalize(params: Tensor) -> dict[str, Tensor]` converting [0,1] values to physical units using the original VocalTract scaling factors.
+- Provide `normalize(physical_values: dict) -> Tensor` for the inverse operation.
+
+**Physical unit conversions (original VocalTract):**
+- Amplitude parameters (`aa`, `ga`, `na`, `fa`): raw value / 255
+- Pitch/rate parameters (`gp`, `vp`, `vr`, `f1-f4`, `nf`): raw_value * scale_factor
+  - `gp`: (value - 100) maps to log-frequency around 110Hz
+  - `vp`: (value - 48) maps to ±1/2 octave swing from base pitch
+  - `vr`: value * 0.0763 Hz
+  - `f1-f4`: value * 19.53 Hz
+  - `nf`: value * 19.53 Hz
+  - `ff`: value * 39.06 Hz
 
 **Expected Output:**
 - `from vocaltract.params import PARAM_DIM, PARAM_NAMES` works.
-- `test_params.py` asserts `PARAM_DIM == 13` and that all names are unique.
+- `test_params.py` asserts `PARAM_DIM == 13`, all names are unique, and matches the original VocalTract ordering.
+- Denormalization produces physically sensible values consistent with the Spin implementation.
 
 ---
 
