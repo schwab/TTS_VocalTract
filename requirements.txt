@@ -1,5 +1,5 @@
 torch>=2.1
-torchlpc>=0.2
+torchlpc==0.7.2  # needs python3-dev headers to build its C++ extension
 numpy
 scipy
 soundfile

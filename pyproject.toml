@@ -9,6 +9,7 @@ description = "Differentiable, LPC-based neural vocoder inspired by the Parallax
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.1",
+    "torchlpc>=0.7.2,<0.8",
     "numpy",
     "scipy",
     "soundfile",
