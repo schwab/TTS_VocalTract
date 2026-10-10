@@ -10,6 +10,8 @@ Measures, on a fixed frame grid, the quantities that map onto VocalTract's
   that VocalTract sends through its formant resonators (``ga``/``aa``)
 - **high-band RMS and centroid** (> ``split_hz``) -> frication (``fa``/``ff``),
   which VocalTract adds *after* the resonators as noise-jittered sine
+- **HNR** (Praat harmonicity) -> breathiness: aspiration (``aa``) mixed into
+  voiced frames
 
 Praat is used through ``parselmouth`` (``pip install praat-parselmouth``).
 """
@@ -31,6 +33,7 @@ class Track:
     high_rms: np.ndarray   # RMS above split_hz
     high_centroid: np.ndarray  # Hz, spectral centroid above split_hz
     max_formant: float     # Praat ceiling used for formant search
+    hnr: np.ndarray = None  # dB, Praat harmonicity (NaN where undefined)
 
     @property
     def voiced(self) -> np.ndarray:
@@ -98,5 +101,9 @@ def track(audio: np.ndarray, sr: int, hop: float, *, f0_min: float = 60.0,
     high_rms = _frame_rms(signal.sosfiltfilt(sos_hi, audio), sr, times, width)
     centroid = _high_centroid(audio, sr, times, split_hz, max(width, 0.016))
 
+    harmonicity = snd.to_harmonicity_cc(time_step=hop, minimum_pitch=f0_min)
+    hnr = np.array([harmonicity.get_value(t) for t in times], dtype=np.float64)
+    hnr[hnr < -100] = np.nan                     # Praat's -200 dB = undefined (silence)
+
     return Track(times=times, f0=f0, formants=formants, low_rms=low_rms, high_rms=high_rms,
-                 high_centroid=centroid, max_formant=max_formant)
+                 high_centroid=centroid, max_formant=max_formant, hnr=hnr)

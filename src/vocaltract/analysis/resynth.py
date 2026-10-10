@@ -11,13 +11,17 @@ linearly towards each frame, so frame k carries the features at the *end* of
 its interval):
 
 ==========  =================================================================
-``gp``      Praat f0 -> 100 + 48*log2(f0/110); held across unvoiced gaps at the
-            *next* voiced value so onsets start on pitch
-``f1..f4``  Praat Burg formants -> Hz / 19.53, gap-filled and median-smoothed
+``gp``      Praat f0 -> 100 + 48*log2(f0/110), with a voicing hangover over
+            decaying syllable tails; held through each fade-out frame, then
+            set to the *next* voiced value so onsets start on pitch
+``f1..f4``  Praat Burg formants (voiced frames) -> Hz / 19.53, median-smoothed;
+            unvoiced gaps hold the previous shape for their first half and
+            take the next syllable's for the second
 ``ga``      voiced low-band level (calibrated, see below)
 ``aa``      unvoiced low-band level -> breathy / "h" noise through the formants
-``fa,ff``   high-band level where it dominates (s, sh, f...) and its centroid
-            / 39.06 -- frication bypasses the resonators in VocalTract
+``fa,ff``   high-band level where it dominates (s, sh, f...); ff is the
+            centroid / 39.06, held constant per consonant (frication is a
+            noise-jittered sine that bypasses the resonators)
 ``vp,vr``   0 (vibrato is already in the f0 track)
 ``na,nf``   0 (nasals not detected yet)
 ==========  =================================================================
@@ -42,7 +46,7 @@ Outputs in ``out/resynth/``: ``<name>_resynth.wav``, ``<name>_ab.wav``
 """
 
 import argparse
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -66,7 +70,7 @@ class Resynthesis:
     name: str
     frames: np.ndarray               # (N, 13) uint8, frame k targets track time k+1
     audio: np.ndarray                # int32 engine samples at SAMPLE_RATE
-    track: Track
+    track: Track                     # raw analysis of the recording (before hangover)
     metrics: dict = field(default_factory=dict)
 
 
@@ -102,26 +106,153 @@ def _to_byte(x: np.ndarray, lo: int = 0) -> np.ndarray:
     return np.clip(np.round(np.nan_to_num(x)), lo, 255).astype(np.int64)
 
 
-def shape_frames(tr: Track) -> np.ndarray:
+def fricative_weight(tr: Track) -> np.ndarray:
+    """0 for vowels .. 1 for s/sh: how much a frame's energy is high-band noise."""
+    total = np.sqrt(tr.low_rms ** 2 + tr.high_rms ** 2)
+    hf_ratio = tr.high_rms / np.maximum(total, 1e-12)
+    return np.clip((hf_ratio - 0.35) / 0.3, 0.0, 1.0)
+
+
+def extend_voicing(tr: Track, max_frames: int = 5, drop_db: float = 15.0) -> Track:
+    """Voicing hangover: carry voicing past Praat's offset while the voice decays.
+
+    Praat's voicing decision ends a syllable while its tail is still only a
+    few dB down (on the LibriSpeech samples: ~3 dB one frame later, ~6-7 dB
+    two frames later). Cutting ``ga`` there and handing the tail to aspiration
+    noise is what made syllable endings sound garbled. Unvoiced frames right
+    after an offset are relabelled voiced (pitch held) while the low band
+    stays within ``drop_db`` of the last voiced frame and the frame isn't
+    frication-dominated, for at most ``max_frames``.
+    """
+    f0 = tr.f0.copy()
+    frication = fricative_weight(tr) > 0
+    voiced = ~np.isnan(tr.f0)
+    for k in np.flatnonzero(voiced[:-1] & ~voiced[1:]):
+        floor = tr.low_rms[k] * 10 ** (-drop_db / 20)
+        for j in range(k + 1, min(k + 1 + max_frames, len(f0))):
+            # A decaying vowel loses its low band first, so its high/low ratio
+            # rises; only stop for frication if the high band itself grew.
+            fricative_onset = frication[j] and tr.high_rms[j] > 2 * tr.high_rms[k]
+            if voiced[j] or fricative_onset or tr.low_rms[j] < floor:
+                break
+            f0[j] = f0[k]
+    return replace(tr, f0=f0)
+
+
+def _bridge_gaps(x: np.ndarray, voiced: np.ndarray, hold) -> np.ndarray:
+    """Fill each unvoiced run: the first ``hold(run_length)`` frames keep the
+    previous voiced value, the rest take the next voiced value.
+
+    VocalTract glides linearly into every frame, so what matters is which
+    *intervals* change: pitch must not move during the fade-out interval
+    (voiced -> unvoiced, ``hold=1``), and formants should hold through the
+    decaying tail and move to the next syllable's shape before its onset.
+    """
+    x = x.astype(np.float64).copy()
+    n = len(x)
+    if not voiced.any():
+        return _fill_gaps(x)
+    k = 0
+    while k < n:
+        if voiced[k]:
+            k += 1
+            continue
+        e = k
+        while e + 1 < n and not voiced[e + 1]:
+            e += 1
+        prev = x[k - 1] if k > 0 else x[e + 1]
+        nxt = x[e + 1] if e + 1 < n else prev
+        h = min(hold(e - k + 1), e - k + 1) if k > 0 else 0
+        x[k:k + h] = prev
+        x[k + h:e + 1] = nxt
+        k = e + 1
+    return x
+
+
+def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    """Inclusive (start, end) index pairs of the True runs in ``mask``."""
+    edges = np.flatnonzero(np.diff(np.concatenate([[0], mask.astype(np.int8), [0]])))
+    return [(int(s), int(e) - 1) for s, e in zip(edges[::2], edges[1::2])]
+
+
+def _smooth_runs(x: np.ndarray, mask: np.ndarray, width: int) -> np.ndarray:
+    """Hann-window moving average inside each run of ``mask`` (edges renormalized)."""
+    if width < 3:
+        return x
+    out = x.copy()
+    for s, e in _runs(mask):
+        seg = x[s:e + 1]
+        n = min(width, len(seg) | 1 if len(seg) % 2 else len(seg) - 1)   # odd, <= run length
+        if n < 3:
+            continue
+        w = np.hanning(n + 2)[1:-1]
+        out[s:e + 1] = np.convolve(seg, w, "same") / np.convolve(np.ones_like(seg), w, "same")
+    return out
+
+
+def _voiced_track(x: np.ndarray, voiced: np.ndarray, kernel: int, smooth: int = 0) -> np.ndarray:
+    """Values on voiced frames only: gap-filled within voicing, median-smoothed,
+    then optionally Hann-smoothed over ``smooth`` frames within each voiced run."""
+    out = np.full(len(x), np.nan)
+    if voiced.sum() == 0:
+        return out
+    v = _fill_gaps(np.where(voiced, x, np.nan))
+    v[voiced] = signal.medfilt(v[voiced], kernel) if voiced.sum() >= kernel else v[voiced]
+    v = _smooth_runs(v, voiced, smooth)
+    out[voiced] = v[voiced]
+    return out
+
+
+def shape_frames(tr: Track, formant_smooth: int = 0) -> np.ndarray:
     """Pitch, formant and frication-frequency bytes (amplitudes left at 0)."""
     n = len(tr.times) - 1
     frames = np.zeros((n, PARAM_COUNT), dtype=np.int64)
+    voiced = tr.voiced[1:]
 
-    gp = pitch_to_gp(tr.f0[1:])
-    gp[~np.isnan(gp)] = signal.medfilt(gp[~np.isnan(gp)], 3) if (~np.isnan(gp)).sum() >= 3 \
-        else gp[~np.isnan(gp)]
-    frames[:, GP] = _to_byte(_fill_gaps(gp, prefer_next=True))
+    gp = _voiced_track(pitch_to_gp(tr.f0[1:]), voiced, 3)
+    frames[:, GP] = _to_byte(_bridge_gaps(gp, voiced, hold=lambda length: 1))
 
-    fmt = np.stack([signal.medfilt(_fill_gaps(tr.formants[1:, i]), 5) for i in range(4)], 1)
+    if voiced.any():
+        fmt = np.stack([_bridge_gaps(_voiced_track(tr.formants[1:, i], voiced, 5, formant_smooth),
+                                     voiced,
+                                     hold=lambda length: (length + 1) // 2)
+                        for i in range(4)], 1)
+    else:                                   # whisper: no voicing to anchor on
+        fmt = np.stack([signal.medfilt(_fill_gaps(tr.formants[1:, i]), 5) for i in range(4)], 1)
     fmt = np.sort(np.nan_to_num(fmt, nan=3500.0), axis=1)
     frames[:, F1:F1 + 4] = _to_byte(fmt / FORMANT_SCALE, lo=1)
 
-    ff = signal.medfilt(_fill_gaps(tr.high_centroid[1:]), 5)
-    frames[:, FF] = _to_byte(np.nan_to_num(ff, nan=4000.0) / FRICATION_FREQ_SCALE, lo=1)
+    frames[:, FF] = _to_byte(segment_ff(tr) / FRICATION_FREQ_SCALE, lo=1)
     return frames
 
 
-def source_targets(tr: Track) -> dict[int, np.ndarray]:
+def segment_ff(tr: Track) -> np.ndarray:
+    """Frication frequency, held constant across each frication segment.
+
+    VocalTract's frication is a noise-jittered *sine* at ff, not white noise,
+    so a per-frame centroid makes the hiss audibly change pitch inside every
+    s/sh/f -- a warbling, robotic consonant. Like Chip's hand-made 'seven'
+    (one ff per consonant), each run of fricative frames gets the median
+    centroid of the run; frames outside runs take the nearest run's value.
+    """
+    centroid = _fill_gaps(tr.high_centroid[1:])
+    centroid = np.nan_to_num(centroid, nan=4000.0)
+    fric = fricative_weight(tr)[1:] > 0
+    ff = np.full(len(centroid), np.nan)
+    k = 0
+    while k < len(fric):
+        if not fric[k]:
+            k += 1
+            continue
+        e = k
+        while e + 1 < len(fric) and fric[e + 1]:
+            e += 1
+        ff[k:e + 1] = np.median(centroid[k:e + 1])
+        k = e + 1
+    return _fill_gaps(ff) if fric.any() else centroid
+
+
+def source_targets(tr: Track, breathiness: float = 0.0) -> dict[int, np.ndarray]:
     """Desired output RMS per frame for each source (recording units)."""
     voiced = tr.voiced[1:]
     low, high = tr.low_rms[1:], tr.high_rms[1:]
@@ -129,12 +260,19 @@ def source_targets(tr: Track) -> dict[int, np.ndarray]:
     floor = np.percentile(total, 10)                           # room noise between words
     audible = total > max(total.max() * 10 ** (SILENCE_DB / 20),
                           floor * 10 ** (NOISE_FLOOR_DB / 20))
-
-    hf_ratio = high / np.maximum(total, 1e-12)
-    fric_weight = np.clip((hf_ratio - 0.35) / 0.3, 0.0, 1.0)   # 0 for vowels, 1 for s/sh
+    fric_weight = fricative_weight(tr)[1:]
+    # Breathiness: the recording's noise share of each voiced frame (from
+    # Praat's HNR) goes to aspiration, which VocalTract sends through the same
+    # formants. Breath noise excites the formants between harmonics, so vowels
+    # stay identifiable at high f0, where the narrow resonators would otherwise
+    # land between the widely spaced harmonics.
+    noise_share = np.zeros(len(low))
+    if breathiness > 0:
+        hnr = np.nan_to_num(tr.hnr[1:], nan=20.0)
+        noise_share = np.clip(breathiness / (1 + 10 ** (hnr / 10)), 0.0, 0.9)
     return {
-        GA: np.where(voiced & audible, low, 0.0),
-        AA: np.where(~voiced & audible, low, 0.0),
+        GA: np.where(voiced & audible, low * np.sqrt(1 - noise_share), 0.0),
+        AA: np.where(audible, np.where(voiced, low * np.sqrt(noise_share), low), 0.0),
         FA: np.where(audible, high * fric_weight, 0.0),
     }
 
@@ -201,6 +339,23 @@ def calibrate(shape: np.ndarray, targets: dict[int, np.ndarray], ga_p99: float,
     return frames, scale
 
 
+def drop_islands(frames: np.ndarray) -> np.ndarray:
+    """Silence runs of sound that have neither voicing nor frication.
+
+    Between words these are breaths, lip noise and room noise that passed the
+    gate. Real consonants carry frication, and in-word aspiration ('h', stop
+    releases into a vowel) is contiguous with voicing, so both survive. Sent
+    through VocalTract's narrow resonators, a soft broadband breath turns into
+    a tonal chirp, which is why these stood out in the silences.
+    """
+    frames = frames.copy()
+    sounding = frames[:, [GA, AA, FA]].any(axis=1)
+    for s, e in _runs(sounding):
+        if not frames[s:e + 1, GA].any() and not frames[s:e + 1, FA].any():
+            frames[s:e + 1, [GA, AA, FA]] = 0
+    return frames
+
+
 def _overflowed(frames: np.ndarray, audio: np.ndarray) -> bool:
     """Compare the full render with the sum of its sources rendered alone.
 
@@ -221,17 +376,21 @@ def _overflowed(frames: np.ndarray, audio: np.ndarray) -> bool:
 
 def resynthesize(audio: np.ndarray, sr: int, name: str = "clip", *, ga_p99: float = 110.0,
                  max_formant: float | None = None, f0_min: float = 60.0,
-                 f0_max: float = 500.0) -> Resynthesis:
-    tr = track(audio, sr, HOP_S, f0_min=f0_min, f0_max=f0_max, max_formant=max_formant)
-    shape = shape_frames(tr)
-    targets = source_targets(tr)
+                 f0_max: float = 500.0, hangover: int = 5, formant_smooth: int = 0,
+                 keep_breaths: bool = False, breathiness: float = 0.0) -> Resynthesis:
+    raw = track(audio, sr, HOP_S, f0_min=f0_min, f0_max=f0_max, max_formant=max_formant)
+    tr = extend_voicing(raw, max_frames=hangover) if hangover else raw
+    shape = shape_frames(tr, formant_smooth)
+    targets = source_targets(tr, breathiness)
     for attempt in range(5):
         frames, _ = calibrate(shape, targets, ga_p99)
+        if not keep_breaths:
+            frames = drop_islands(frames)
         out = render_frames(frames)
         if not _overflowed(frames, out):
             break
         ga_p99 *= 0.7
-    res = Resynthesis(name, frames.astype(np.uint8), out, tr)
+    res = Resynthesis(name, frames.astype(np.uint8), out, raw)   # evaluate against raw Praat
     res.metrics["ga_p99"] = ga_p99
     res.metrics["overflow_retries"] = attempt
     return res
@@ -240,6 +399,31 @@ def resynthesize(audio: np.ndarray, sr: int, name: str = "clip", *, ga_p99: floa
 # ---------------------------------------------------------------------------
 # evaluation
 # ---------------------------------------------------------------------------
+
+def edge_metrics(frames: np.ndarray) -> dict:
+    """How syllable endings are rendered (where 'garbled tails' come from).
+
+    At each voicing offset (ga > 0 -> ga == 0):
+    - ``offset_pitch_swing``: fraction where gp moves >= 6 units (1.5
+      semitones) during the fade-out interval -- an audible pitch swoop
+    - ``offset_cut_db``: median level of the last voiced ga relative to its
+      syllable's median ga; near 0 dB means the voice is chopped off at full
+      level instead of decaying
+    """
+    ga = frames[:, GA].astype(np.int64)
+    gp = frames[:, GP].astype(np.int64)
+    offsets = np.flatnonzero((ga[:-1] > 0) & (ga[1:] == 0))
+    if not offsets.size:
+        return {"offset_pitch_swing": float("nan"), "offset_cut_db": float("nan")}
+    swing = np.abs(gp[offsets + 1] - gp[offsets]) >= 6
+    cut = []
+    for k in offsets:
+        j = k
+        while j > 0 and ga[j - 1] > 0:
+            j -= 1
+        cut.append(20 * np.log10(ga[k] / max(np.median(ga[j:k + 1]), 1)))
+    return {"offset_pitch_swing": float(swing.mean()), "offset_cut_db": float(np.median(cut))}
+
 
 def _mel_db(x: np.ndarray, sr: int, n_mels: int = 40, nfft: int = 512) -> np.ndarray:
     hop = int(sr * 0.01)
@@ -296,7 +480,15 @@ def evaluate(res: Resynthesis, audio: np.ndarray, sr: int, f0_min=60.0, f0_max=5
     floor = mo.max() - 60                                  # don't score silence vs room noise
     lsd = float(np.mean(np.abs(np.maximum(ms, floor) - np.maximum(mo, floor))[:, loud]))
 
+    try:
+        from pystoi import stoi
+        intelligibility = float(stoi(orig, synth, sr, extended=False))
+    except ImportError:
+        intelligibility = float("nan")
+
     return {
+        **edge_metrics(res.frames),
+        "stoi": intelligibility,
         "voiced_fraction": float(tr_o.voiced.mean()),
         "voicing_agreement": float(voicing_agree),
         "pitch_error_cents_median": float(np.median(cents)) if cents.size else float("nan"),
@@ -431,6 +623,15 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--f0-max", type=float, default=500.0)
     ap.add_argument("--ga-p99", type=float, default=110.0,
                     help="99th-percentile glottal amplitude byte (loudness vs overflow)")
+    ap.add_argument("--hangover", type=int, default=5,
+                    help="max frames of voicing carried over decaying syllable tails (0 = off)")
+    ap.add_argument("--breathiness", type=float, default=0.0,
+                    help="aspiration mixed into voiced frames, x the recording's noise share "
+                         "(from HNR); 0 = off, 1 = matched")
+    ap.add_argument("--formant-smooth", type=int, default=0,
+                    help="Hann smoothing of formant tracks within voiced runs, in frames (0 = off)")
+    ap.add_argument("--keep-breaths", action="store_true",
+                    help="keep sound islands with no voicing or frication (breaths, lip noise)")
     ap.add_argument("--spin", action="store_true", help="also write a Propeller player .spin")
     args = ap.parse_args(argv)
 
@@ -444,7 +645,9 @@ def main(argv: list[str] | None = None) -> None:
         audio = audio[lo:hi]
 
         res = resynthesize(audio, sr, path.stem, ga_p99=args.ga_p99,
-                           max_formant=args.max_formant, f0_min=args.f0_min, f0_max=args.f0_max)
+                           max_formant=args.max_formant, f0_min=args.f0_min, f0_max=args.f0_max,
+                           hangover=args.hangover, breathiness=args.breathiness,
+                           formant_smooth=args.formant_smooth, keep_breaths=args.keep_breaths)
         res.metrics.update(evaluate(res, audio, sr, args.f0_min, args.f0_max))
         paths = write_outputs(res, audio, sr, args.out_dir, spin=args.spin)
 
@@ -455,7 +658,9 @@ def main(argv: list[str] | None = None) -> None:
               f"pitch error {m['pitch_error_cents_median']:.0f} cents (median)")
         print("  formant frames vs track (median Hz): "
               + ", ".join(f"F{i + 1} {e:.0f}" for i, e in enumerate(m["formant_error_hz_median"])))
-        print(f"  log-mel distance {m['log_mel_distance_db']:.1f} dB, "
+        print(f"  syllable endings: pitch swoop in {m['offset_pitch_swing']:.0%}, "
+              f"voice cut at {m['offset_cut_db']:+.1f} dB re syllable")
+        print(f"  log-mel distance {m['log_mel_distance_db']:.1f} dB, STOI {m['stoi']:.2f}, "
               f"ga p99 {m['ga_p99']:.0f}, overflow retries {m['overflow_retries']}")
         for p in paths:
             print(f"  -> {p}")
