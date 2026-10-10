@@ -135,6 +135,12 @@ python -m vocaltract.analysis.resynth assets/recordings/198-209-0000.ogg --spin
 
 The `_player.spin` file plays the same frames on a real Propeller (P10/P11, needs `VocalTract.spin`).
 
+**Intelligibility metric.** The report includes the Whisper word error rate (WER) of the resynthesis
+next to the WER of the original recording (the floor), scored against `<clip>.txt` when present
+(`--asr none` to skip, `--asr base.en` for a faster model). Spectral metrics (log-mel distance, STOI)
+proved misleading on this project, so WER plus listening is the yardstick. To score any WAV:
+`python -m vocaltract.analysis.intelligibility file.wav --ref-file transcript.txt`.
+
 ## Roadmap
 
 - [ ] **Phase 1** — Minimal differentiable LPC pipeline (random audio → params → LPC → reconstruction)

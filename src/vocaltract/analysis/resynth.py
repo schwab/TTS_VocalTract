@@ -18,7 +18,8 @@ its interval):
             unvoiced gaps hold the previous shape for their first half and
             take the next syllable's for the second
 ``ga``      voiced low-band level (calibrated, see below)
-``aa``      unvoiced low-band level -> breathy / "h" noise through the formants
+``aa``      unvoiced low-band level -> "h" noise through the formants, plus the
+            recording's breath share (from HNR) of each voiced frame
 ``fa,ff``   high-band level where it dominates (s, sh, f...); ff is the
             centroid / 39.06, held constant per consonant (frication is a
             noise-jittered sine that bypasses the resonators)
@@ -377,7 +378,7 @@ def _overflowed(frames: np.ndarray, audio: np.ndarray) -> bool:
 def resynthesize(audio: np.ndarray, sr: int, name: str = "clip", *, ga_p99: float = 110.0,
                  max_formant: float | None = None, f0_min: float = 60.0,
                  f0_max: float = 500.0, hangover: int = 5, formant_smooth: int = 0,
-                 keep_breaths: bool = False, breathiness: float = 0.0) -> Resynthesis:
+                 keep_breaths: bool = False, breathiness: float = 1.0) -> Resynthesis:
     raw = track(audio, sr, HOP_S, f0_min=f0_min, f0_max=f0_max, max_formant=max_formant)
     tr = extend_voicing(raw, max_frames=hangover) if hangover else raw
     shape = shape_frames(tr, formant_smooth)
@@ -497,6 +498,31 @@ def evaluate(res: Resynthesis, audio: np.ndarray, sr: int, f0_min=60.0, f0_max=5
     }
 
 
+def asr_metrics(res: Resynthesis, audio: np.ndarray, sr: int, model: str,
+                reference: str | None = None) -> dict:
+    """Whisper word error rate for the original recording and the resynthesis.
+
+    Without a reference transcript, the original's own transcript is used as
+    the reference (so the original scores 0% by construction).
+    """
+    from .intelligibility import transcribe, word_error_rate
+
+    hyp_orig = transcribe(audio, sr, model)
+    hyp_synth = transcribe(res.audio.astype(np.float64), SAMPLE_RATE, model)
+    ref = reference if reference else hyp_orig
+    orig = word_error_rate(ref, hyp_orig)
+    synth = word_error_rate(ref, hyp_synth)
+    return {
+        "asr_model": model,
+        "asr_reference": "transcript file" if reference else "ASR of original",
+        "wer_original": orig.wer,
+        "wer_resynth": synth.wer,
+        "wer_resynth_detail": synth.summary(),
+        "asr_text_original": hyp_orig,
+        "asr_text_resynth": hyp_synth,
+    }
+
+
 # ---------------------------------------------------------------------------
 # outputs
 # ---------------------------------------------------------------------------
@@ -527,6 +553,15 @@ def write_outputs(res: Resynthesis, audio: np.ndarray, sr: int, out_dir: Path,
     np.savetxt(p, np.column_stack([times, res.frames]), delimiter=",", header=header,
                comments="", fmt=["%.4f"] + ["%d"] * PARAM_COUNT)
     paths.append(p)
+
+    if "asr_text_resynth" in res.metrics:
+        m = res.metrics
+        p = out_dir / f"{res.name}_asr.txt"
+        p.write_text(f"model: {m['asr_model']}  reference: {m['asr_reference']}\n"
+                     f"original    (WER {m['wer_original']:.1%}): {m['asr_text_original']}\n"
+                     f"resynthesis (WER {m['wer_resynth']:.1%}): {m['asr_text_resynth']}\n",
+                     encoding="utf-8")
+        paths.append(p)
 
     paths.append(plot(res, audio, sr, out_dir / f"{res.name}.png"))
     if spin:
@@ -625,13 +660,17 @@ def main(argv: list[str] | None = None) -> None:
                     help="99th-percentile glottal amplitude byte (loudness vs overflow)")
     ap.add_argument("--hangover", type=int, default=5,
                     help="max frames of voicing carried over decaying syllable tails (0 = off)")
-    ap.add_argument("--breathiness", type=float, default=0.0,
+    ap.add_argument("--breathiness", type=float, default=1.0,
                     help="aspiration mixed into voiced frames, x the recording's noise share "
-                         "(from HNR); 0 = off, 1 = matched")
+                         "(from HNR); 0 = off, 1 = matched (default; cut female WER 53%%->43%%)")
     ap.add_argument("--formant-smooth", type=int, default=0,
-                    help="Hann smoothing of formant tracks within voiced runs, in frames (0 = off)")
+                    help="Hann smoothing of formant tracks within voiced runs, in frames "
+                         "(0 = off; raised WER on both test voices -- fast formant motion "
+                         "carries consonant cues)")
     ap.add_argument("--keep-breaths", action="store_true",
                     help="keep sound islands with no voicing or frication (breaths, lip noise)")
+    ap.add_argument("--asr", default="small.en",
+                    help="Whisper model for the word-error-rate metric, or 'none' (default small.en)")
     ap.add_argument("--spin", action="store_true", help="also write a Propeller player .spin")
     args = ap.parse_args(argv)
 
@@ -649,6 +688,11 @@ def main(argv: list[str] | None = None) -> None:
                            hangover=args.hangover, breathiness=args.breathiness,
                            formant_smooth=args.formant_smooth, keep_breaths=args.keep_breaths)
         res.metrics.update(evaluate(res, audio, sr, args.f0_min, args.f0_max))
+        if args.asr != "none":
+            from .intelligibility import reference_for
+            trimmed = args.start > 0 or args.duration is not None
+            ref = None if trimmed else reference_for(path)   # transcript covers the whole file
+            res.metrics.update(asr_metrics(res, audio, sr, args.asr, ref))
         paths = write_outputs(res, audio, sr, args.out_dir, spin=args.spin)
 
         m = res.metrics
@@ -662,6 +706,10 @@ def main(argv: list[str] | None = None) -> None:
               f"voice cut at {m['offset_cut_db']:+.1f} dB re syllable")
         print(f"  log-mel distance {m['log_mel_distance_db']:.1f} dB, STOI {m['stoi']:.2f}, "
               f"ga p99 {m['ga_p99']:.0f}, overflow retries {m['overflow_retries']}")
+        if "wer_resynth" in m:
+            print(f"  Whisper {m['asr_model']} WER: original {m['wer_original']:.0%}, "
+                  f"resynthesis {m['wer_resynth_detail']}  [reference: {m['asr_reference']}]")
+            print(f"    heard: {m['asr_text_resynth']}")
         for p in paths:
             print(f"  -> {p}")
 

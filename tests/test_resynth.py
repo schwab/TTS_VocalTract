@@ -143,9 +143,28 @@ def test_smooth_runs_stays_inside_runs():
 def test_breathiness_moves_energy_to_aspiration(vowel_resynth):
     from vocaltract.analysis.resynth import source_targets
     res, _ = vowel_resynth
-    plain = source_targets(res.track)
+    plain = source_targets(res.track, breathiness=0.0)
     breathy = source_targets(res.track, breathiness=1.0)
     voiced = plain[GA] > 0
     assert (breathy[AA][voiced] > 0).any()
     np.testing.assert_allclose(breathy[GA][voiced] ** 2 + breathy[AA][voiced] ** 2,
                                plain[GA][voiced] ** 2)   # energy split, not added
+
+
+def test_word_error_rate_counts():
+    pytest.importorskip("jiwer")
+    pytest.importorskip("whisper")
+    from vocaltract.analysis.intelligibility import word_error_rate
+    r = word_error_rate("Go, by all means, my dear!", "go by all memes my dear")
+    assert (r.substitutions, r.deletions, r.insertions, r.reference_words) == (1, 0, 0, 6)
+    assert r.wer == pytest.approx(1 / 6)
+    assert word_error_rate("Mrs. Allen said", "missus allen said").wer == 0.0   # normalizer
+    assert word_error_rate("one two", "").wer == 1.0
+
+
+def test_reference_transcripts_exist_for_sample_recordings():
+    from pathlib import Path
+    from vocaltract.analysis.intelligibility import reference_for
+    rec = Path(__file__).resolve().parents[1] / "assets" / "recordings"
+    for clip in ("198-209-0000.ogg", "5703-47212-0000.ogg"):
+        assert len(reference_for(rec / clip).split()) > 30

@@ -18,7 +18,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest", "tqdm"]
 reference = ["numba"]
-analysis = ["numba", "praat-parselmouth", "matplotlib"]
+analysis = ["numba", "praat-parselmouth", "matplotlib", "openai-whisper", "jiwer", "pystoi"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
