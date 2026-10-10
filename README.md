@@ -120,6 +120,21 @@ python -m vocaltract.reference.singing_demo_seven --sync  # parts in lockstep
 python -m vocaltract.reference.singing_demo               # out/singing_demo.wav (held vowels)
 ```
 
+### Analysis / resynthesis (level A)
+
+`vocaltract.analysis.resynth` maps a recording onto VocalTract frames with classic speech analysis
+(Praat pitch and formants, band levels, no ML), calibrates the source levels against the reference
+engine, and renders the result. It's a baseline for how much of a real voice fits in 13 bytes, and
+a starting point for gradient fitting.
+
+```bash
+pip install praat-parselmouth matplotlib
+python -m vocaltract.analysis.resynth assets/recordings/198-209-0000.ogg --spin
+# out/resynth/: _resynth.wav, _ab.wav (original then resynthesis), _frames.csv, .png, _player.spin
+```
+
+The `_player.spin` file plays the same frames on a real Propeller (P10/P11, needs `VocalTract.spin`).
+
 ## Roadmap
 
 - [ ] **Phase 1** — Minimal differentiable LPC pipeline (random audio → params → LPC → reconstruction)
