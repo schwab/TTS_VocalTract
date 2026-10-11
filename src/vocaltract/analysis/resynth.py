@@ -43,7 +43,8 @@ Usage::
 
 Outputs in ``out/resynth/``: ``<name>_resynth.wav``, ``<name>_ab.wav``
 (original, then resynthesis), ``<name>_frames.csv``, ``<name>.png``
-(spectrograms + parameter lanes) and optionally ``<name>_player.spin``.
+(spectrograms + parameter lanes), ``<name>_compare.html`` (interactive
+side-by-side, see ``compare.py``) and optionally ``<name>_player.spin``.
 """
 
 import argparse
@@ -505,10 +506,10 @@ def asr_metrics(res: Resynthesis, audio: np.ndarray, sr: int, model: str,
     Without a reference transcript, the original's own transcript is used as
     the reference (so the original scores 0% by construction).
     """
-    from .intelligibility import transcribe, word_error_rate
+    from .intelligibility import transcribe_words, word_error_rate
 
-    hyp_orig = transcribe(audio, sr, model)
-    hyp_synth = transcribe(res.audio.astype(np.float64), SAMPLE_RATE, model)
+    hyp_orig, words_orig = transcribe_words(audio, sr, model)
+    hyp_synth, words_synth = transcribe_words(res.audio.astype(np.float64), SAMPLE_RATE, model)
     ref = reference if reference else hyp_orig
     orig = word_error_rate(ref, hyp_orig)
     synth = word_error_rate(ref, hyp_synth)
@@ -520,6 +521,8 @@ def asr_metrics(res: Resynthesis, audio: np.ndarray, sr: int, model: str,
         "wer_resynth_detail": synth.summary(),
         "asr_text_original": hyp_orig,
         "asr_text_resynth": hyp_synth,
+        "asr_words_original": words_orig,
+        "asr_words_resynth": words_synth,
     }
 
 
@@ -527,8 +530,25 @@ def asr_metrics(res: Resynthesis, audio: np.ndarray, sr: int, model: str,
 # outputs
 # ---------------------------------------------------------------------------
 
+def write_compare(res: Resynthesis, audio: np.ndarray, sr: int, path: Path) -> Path:
+    """Interactive side-by-side page: original vs resynthesis, with the frames overlaid."""
+    from .compare import Clip, build_page
+
+    m = res.metrics
+    note_o = f"Whisper WER {m['wer_original']:.0%}" if "wer_original" in m else ""
+    note_s = f"Whisper WER {m['wer_resynth']:.0%}" if "wer_resynth" in m else ""
+    clips = [Clip("original", np.asarray(audio, dtype=np.float64), sr, note_o),
+             Clip("VocalTract resynthesis", res.audio.astype(np.float64) / 2**31, SAMPLE_RATE, note_s)]
+    words = ([m["asr_words_original"], m["asr_words_resynth"]]
+             if "asr_words_original" in m else None)
+    times = (np.arange(len(res.frames)) + 1) * HOP_S
+    path.write_text(build_page(clips, frames=res.frames, frame_times=times, words=words,
+                               title=f"{res.name}: original vs resynthesis"), encoding="utf-8")
+    return path
+
+
 def write_outputs(res: Resynthesis, audio: np.ndarray, sr: int, out_dir: Path,
-                  spin: bool = False) -> list[Path]:
+                  spin: bool = False, compare: bool = True) -> list[Path]:
     import soundfile as sf
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -564,6 +584,8 @@ def write_outputs(res: Resynthesis, audio: np.ndarray, sr: int, out_dir: Path,
         paths.append(p)
 
     paths.append(plot(res, audio, sr, out_dir / f"{res.name}.png"))
+    if compare:
+        paths.append(write_compare(res, audio, sr, out_dir / f"{res.name}_compare.html"))
     if spin:
         paths.append(export_spin(res.frames, out_dir / f"{res.name}_player.spin", res.name))
     return paths
@@ -672,6 +694,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--asr", default="small.en",
                     help="Whisper model for the word-error-rate metric, or 'none' (default small.en)")
     ap.add_argument("--spin", action="store_true", help="also write a Propeller player .spin")
+    ap.add_argument("--no-compare", action="store_true",
+                    help="skip the interactive <name>_compare.html page")
     args = ap.parse_args(argv)
 
     import soundfile as sf
@@ -693,7 +717,8 @@ def main(argv: list[str] | None = None) -> None:
             trimmed = args.start > 0 or args.duration is not None
             ref = None if trimmed else reference_for(path)   # transcript covers the whole file
             res.metrics.update(asr_metrics(res, audio, sr, args.asr, ref))
-        paths = write_outputs(res, audio, sr, args.out_dir, spin=args.spin)
+        paths = write_outputs(res, audio, sr, args.out_dir, spin=args.spin,
+                              compare=not args.no_compare)
 
         m = res.metrics
         print(f"{path.name}: {len(res.frames)} frames, {len(audio) / sr:.1f} s, "

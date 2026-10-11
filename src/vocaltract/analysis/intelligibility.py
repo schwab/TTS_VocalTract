@@ -86,6 +86,25 @@ def transcribe(audio: np.ndarray, sr: int, model: str = DEFAULT_MODEL) -> str:
     return result["text"].strip()
 
 
+def transcribe_words(audio: np.ndarray, sr: int,
+                     model: str = DEFAULT_MODEL) -> tuple[str, list[dict]]:
+    """Like :func:`transcribe`, plus word timings ``[{"word", "start", "end"}, ...]`` (seconds)."""
+    from scipy import signal
+
+    x = np.asarray(audio, dtype=np.float64)
+    if sr != ASR_RATE:
+        x = signal.resample_poly(x, ASR_RATE, sr)
+    peak = np.abs(x).max()
+    if peak > 0:
+        x = x * (0.9 / peak)
+    result = load_model(model).transcribe(
+        x.astype(np.float32), language="en", temperature=0.0, word_timestamps=True,
+        condition_on_previous_text=False, fp16=False)
+    words = [{"word": w["word"].strip(), "start": float(w["start"]), "end": float(w["end"])}
+             for seg in result["segments"] for w in seg.get("words", [])]
+    return result["text"].strip(), words
+
+
 def word_error_rate(reference: str, hypothesis: str) -> WerResult:
     import jiwer
 

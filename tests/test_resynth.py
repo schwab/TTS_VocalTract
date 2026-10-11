@@ -168,3 +168,49 @@ def test_reference_transcripts_exist_for_sample_recordings():
     rec = Path(__file__).resolve().parents[1] / "assets" / "recordings"
     for clip in ("198-209-0000.ogg", "5703-47212-0000.ogg"):
         assert len(reference_for(rec / clip).split()) > 30
+
+
+def test_compare_spectrogram_and_encoding():
+    from vocaltract.analysis.compare import FLOOR_DB, encode_db, spectrogram
+    sr = 16000
+    t = np.arange(sr) / sr
+    x = np.sin(2 * np.pi * 1000 * t)
+    db = spectrogram(x, sr, 0.035, 0.005, 8000, n_cols=210, n_rows=512)
+    assert db.shape == (512, 210) and db.max() == 0.0 and db.min() >= FLOOR_DB
+    peak_row = np.argmax(db[:, 100])
+    assert abs(peak_row / 511 * 8000 - 1000) < 40           # tone lands on its row
+    assert np.all(db[:, 205:] == FLOOR_DB) or db[:, 205:].max() < -60   # past the end: floor
+    import base64, io
+    from PIL import Image
+    img = Image.open(io.BytesIO(base64.b64decode(encode_db(db))))
+    assert img.size == (210, 512) and img.mode == "L"
+
+
+def test_compare_page_contents(vowel_resynth):
+    import json, re
+    from vocaltract.analysis.compare import Clip, build_page, export_sv_layers
+    res, audio = vowel_resynth
+    clips = [Clip("orig", audio, SR), Clip("synth", res.audio / 2**31, 20000)]
+    times = (np.arange(len(res.frames)) + 1) * HOP_S
+    words = [[{"word": "ah", "start": 0.5, "end": 0.9}], []]
+    html = build_page(clips, frames=res.frames, frame_times=times, words=words, praat=False)
+    blob = re.search(r'<script type="application/json" id="data">(.*?)</script>', html, re.S)[1]
+    data = json.loads(blob)
+    assert [c["name"] for c in data["clips"]] == ["orig", "synth"]
+    assert data["fmax"] == 8000 and set(data["diff"]) == {"wide", "narrow"}
+    assert len(data["frames"]["t"]) == len(res.frames)
+    assert data["clips"][0]["words"][0]["word"] == "ah"
+    single = build_page(clips[:1], praat=False)
+    assert '"diff":null' in single and '"frames":null' in single
+
+
+def test_sv_layer_export(tmp_path, vowel_resynth):
+    from vocaltract.analysis.compare import Clip, export_sv_layers
+    res, audio = vowel_resynth
+    times = (np.arange(len(res.frames)) + 1) * HOP_S
+    paths = export_sv_layers(tmp_path, [Clip("orig", audio, SR)], res.frames, times,
+                             [[{"word": "ah", "start": 0.5, "end": 0.9}]])
+    names = sorted(p.name for p in paths)
+    assert "frames_f1_hz.csv" in names and "frames_pitch_hz.csv" in names and "words_orig.csv" in names
+    f1 = np.loadtxt(tmp_path / "frames_f1_hz.csv", delimiter=",")
+    assert f1.shape[1] == 2 and np.median(f1[:, 1]) == pytest.approx(700, abs=80)
