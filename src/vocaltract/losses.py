@@ -40,7 +40,11 @@ def stft_magnitude(audio: torch.Tensor, n_fft: int, hop: int, win_length: int) -
         win_length: Window length in samples (<= n_fft).
 
     Returns:
-        Magnitudes of shape (B, n_fft // 2 + 1, frames), clamped to >= EPS.
+        Magnitudes ``sqrt(re^2 + im^2 + EPS^2)`` of shape (B, n_fft // 2 + 1, frames).
+
+        The EPS^2 floor (rather than ``abs().clamp_min``) keeps the gradient
+        finite: ``abs`` differentiates as z/|z|, and for near-silent audio in
+        float32 (denormals around 1e-40) |z| rounds to 0 while z does not.
     """
     window = torch.hann_window(win_length, dtype=audio.dtype, device=audio.device)
     spec = torch.stft(
@@ -51,7 +55,7 @@ def stft_magnitude(audio: torch.Tensor, n_fft: int, hop: int, win_length: int) -
         window=window,
         return_complex=True,
     )
-    return spec.abs().clamp_min(EPS)
+    return torch.sqrt(spec.real.square() + spec.imag.square() + EPS**2)
 
 
 def spectral_convergence(pred_mag: torch.Tensor, target_mag: torch.Tensor) -> torch.Tensor:

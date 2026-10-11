@@ -141,6 +141,19 @@ next to the WER of the original recording (the floor), scored against `<clip>.tx
 proved misleading on this project, so WER plus listening is the yardstick. To score any WAV:
 `python -m vocaltract.analysis.intelligibility file.wav --ref-file transcript.txt`.
 
+**Side-by-side comparison.** Each run also writes `<name>_compare.html`: a self-contained page with
+linked spectrograms of the original and the resynthesis on identical settings. It has a formants view
+(5 ms window) and a harmonics view (35 ms), a live dB-floor slider, synced playback (keys 1/2 switch
+files at the same moment), overlays of the frames, Praat tracks and Whisper word timings, pitch and
+source lanes, and a difference pane. Compare any files directly:
+
+```bash
+python -m vocaltract.analysis.compare a.wav b.wav --frames out/resynth/x_frames.csv --words \
+    --sv-dir out/sv_layers    # optional: overlays as Sonic Visualiser CSV layers
+```
+
+Views are shareable through the URL, e.g. `x_compare.html#t0=1.6&t1=3.6&res=narrow&diff=1`.
+
 ## Roadmap
 
 - [ ] **Phase 1** — Minimal differentiable LPC pipeline (random audio → params → LPC → reconstruction)

@@ -1,20 +1,20 @@
 """Gradient-flow and single-optimizer-step tests for the Phase 1 pipeline."""
 
+import pytest
 import torch
 
-from vocaltract.filter import LPCFilter, frames_to_samples
 from vocaltract.losses import MultiScaleSTFTLoss
 from vocaltract.mapper import ParamToLPC
-from vocaltract.source import make_excitation
+from vocaltract.params import PARAM_NAMES
+from vocaltract.pipeline import synthesize as pipeline_synthesize
 
 HOP = 160
+GP = PARAM_NAMES.index("gp")
 
 
 def synthesize(params: torch.Tensor, mapper: ParamToLPC, seed: int = 0) -> torch.Tensor:
     """params (B, T_frames, 13) -> audio (B, T_frames * HOP), with fixed-seed noise."""
-    excitation = make_excitation(params, hop=HOP, generator=torch.Generator().manual_seed(seed))
-    coeffs = frames_to_samples(mapper(params), HOP)
-    return LPCFilter()(excitation, coeffs)
+    return pipeline_synthesize(params, mapper, hop=HOP, generator=torch.Generator().manual_seed(seed))
 
 
 class TestToyProblem:
@@ -46,9 +46,17 @@ class TestEndToEnd:
         assert torch.isfinite(params.grad).all()
         assert params.grad.abs().sum() > 0
 
-    def test_one_step_reduces_loss(self):
-        """One Adam step on params moves the synthesized audio toward a target clip."""
-        torch.manual_seed(0)
+    @pytest.mark.parametrize("seed", range(5))
+    def test_one_step_reduces_loss(self, seed):
+        """
+        One Adam step on params moves the synthesized audio toward a target clip.
+
+        Pitch is held fixed, as it is in practice given its own much smaller
+        step: phase is a running sum, so a pitch change in an early frame
+        time-shifts everything after it, and the loss is only locally linear in
+        gp over ~1e-7. The overfit demo uses --pitch-lr-scale for this reason.
+        """
+        torch.manual_seed(seed)
         mapper = ParamToLPC()
         target = synthesize(torch.rand(1, 20, 13), mapper, seed=1).detach()
 
@@ -59,6 +67,7 @@ class TestEndToEnd:
         initial = loss_fn(synthesize(params, mapper), target)
         optimizer.zero_grad()
         initial.backward()
+        params.grad[..., GP] = 0.0
         optimizer.step()
         after = loss_fn(synthesize(params, mapper), target)
         assert after.item() < initial.item()
