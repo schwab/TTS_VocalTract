@@ -141,3 +141,58 @@ class TestInverseTransform:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestBandwidthExpansion:
+    """gamma**i scaling keeps every pole radius <= gamma."""
+
+    def test_pole_radius_bounded_by_gamma_when_saturated(self):
+        for gamma in (0.99, 0.95):
+            model = ParamToLPC(order=10, gamma=gamma).double()
+            with torch.no_grad():
+                model.fc_out.bias.fill_(50.0)  # tanh(50) == 1.0 exactly: poles on the unit circle
+            lpc = model(torch.rand(1, 1, 13, dtype=torch.float64)).flatten().detach().numpy()
+            radius = np.abs(np.roots(np.concatenate([[1.0], -lpc]))).max()
+            assert radius <= gamma + 1e-6, (gamma, radius)
+
+    def test_gamma_one_disables_expansion(self):
+        torch.manual_seed(0)
+        model = ParamToLPC(gamma=1.0)
+        params = torch.rand(2, 5, 13)
+        from vocaltract.mapper import MAX_REFLECTION
+
+        hidden = torch.nn.functional.gelu(model.fc2(torch.nn.functional.gelu(model.fc1(params))))
+        reflection = MAX_REFLECTION * torch.tanh(model.fc_out(hidden))
+        assert torch.allclose(model(params), model._levinson_durbin(reflection.double()))
+
+    def test_expansion_scales_coefficients(self):
+        torch.manual_seed(0)
+        plain = ParamToLPC(gamma=1.0)
+        expanded = ParamToLPC(gamma=0.9)
+        expanded.load_state_dict(plain.state_dict())
+        params = torch.rand(1, 3, 13)
+        scale = 0.9 ** torch.arange(1, 11, dtype=torch.float64)
+        assert torch.allclose(expanded(params), plain(params) * scale)
+
+    @pytest.mark.parametrize("gamma", [0.0, -0.5, 1.5])
+    def test_invalid_gamma(self, gamma):
+        with pytest.raises(ValueError):
+            ParamToLPC(gamma=gamma)
+
+
+class TestPrecision:
+    def test_output_is_float64(self):
+        """Coefficients stay float64: rounding sharp resonances to float32 destabilizes them."""
+        assert ParamToLPC()(torch.rand(1, 2, 13)).dtype == torch.float64
+
+    def test_reflection_capped(self):
+        from vocaltract.mapper import MAX_REFLECTION
+
+        model = ParamToLPC(gamma=1.0)
+        with torch.no_grad():
+            model.fc_out.bias.fill_(50.0)
+        # (to_reflection is too ill-conditioned at |k| = 0.99 to invert reliably,
+        # so compare against the forward recursion applied to the capped value.)
+        capped = torch.full((1, 10), MAX_REFLECTION, dtype=torch.float64)
+        expected = model._levinson_durbin(capped)
+        assert torch.allclose(model(torch.rand(1, 1, 13))[0], expected)

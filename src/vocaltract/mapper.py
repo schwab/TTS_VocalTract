@@ -18,6 +18,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Default bandwidth-expansion factor. Every pole radius is multiplied by GAMMA,
+# so no pole can get closer to the unit circle than 1 - GAMMA. At 16 kHz,
+# 0.99 means a minimum resonance bandwidth of about -ln(0.99) * 16000 / pi ~= 51 Hz,
+# at the narrow end of natural formant bandwidths (~50-200 Hz).
+DEFAULT_GAMMA = 0.99
+
+# Reflection coefficients are capped at +/-MAX_REFLECTION. tanh rounds to exactly
+# +/-1 for large inputs, and |k| = 1 everywhere makes the LPC polynomial's roots
+# coincide (a 10-fold root): rounding the coefficients alone then moves real
+# roots outside the unit circle, and no bandwidth expansion can fix that.
+MAX_REFLECTION = 0.99
+
 
 class ParamToLPC(nn.Module):
     """
@@ -27,8 +39,22 @@ class ParamToLPC(nn.Module):
         - Input: (batch, time, 13) parameter tensor
         - Two fully-connected layers with GELU activation
         - Output layer produces raw values in (-inf, +inf)
-        - tanh maps output to (-1, 1), interpreted as reflection coefficients (PARCOR)
-        - Levinson-Durbin recursion converts PARCOR to LPC coefficients
+        - MAX_REFLECTION * tanh maps output into (-0.99, 0.99), interpreted as
+          reflection coefficients (PARCOR)
+        - Levinson-Durbin recursion converts PARCOR to LPC coefficients (float64)
+        - Bandwidth expansion scales a_i by gamma**i, moving every pole radius
+          r -> gamma * r
+        - Output is float64: order-10 direct-form coefficients with poles near
+          the unit circle are not stable once rounded to float32 (measured:
+          float32 needs |k| <= 0.9 to keep every pole inside, float64 is
+          exact at |k| = 0.99).
+
+    Why bandwidth expansion?
+        Reflection coefficients in (-1, 1) guarantee stability mathematically,
+        but training can push them so close to +/-1 that poles sit within
+        ~1e-10 of the unit circle (tanh even rounds to exactly 1 in float32).
+        The filter's gain then overflows float32 and training diverges.
+        Expansion keeps a fixed margin: every pole radius is <= gamma.
 
     Why reflection coefficients?
         - Guarantee pole stability by construction (all poles inside unit circle)
@@ -39,11 +65,19 @@ class ParamToLPC(nn.Module):
         order: Order of the LPC filter (number of reflection coefficients).
                Typically 8-16 for speech.
         hidden: Hidden dimension size for the two-layer MLP.
+        gamma: Bandwidth-expansion factor in (0, 1]. 1.0 disables expansion.
     """
 
-    def __init__(self, order: int = 10, hidden: int = 64):
+    def __init__(self, order: int = 10, hidden: int = 64, gamma: float = DEFAULT_GAMMA):
         super().__init__()
+        if not 0.0 < gamma <= 1.0:
+            raise ValueError(f"gamma must be in (0, 1], got {gamma}")
         self.order = order
+        self.gamma = gamma
+        # gamma**i for i = 1..order; a buffer so it follows .to(device/dtype)
+        self.register_buffer(
+            "expansion", gamma ** torch.arange(1, order + 1, dtype=torch.float64), persistent=False
+        )
 
         # Two-layer MLP: 13 -> hidden -> hidden -> order
         self.fc1 = nn.Linear(13, hidden)
@@ -64,7 +98,7 @@ class ParamToLPC(nn.Module):
             params: Tensor where the last dimension is the 13 parameters.
 
         Returns:
-            Tensor of shape (B, T, order) containing LPC coefficients.
+            float64 tensor of shape (B, T, order) containing LPC coefficients.
         """
         if params.ndim == 1:
             params = params.unsqueeze(0).unsqueeze(0)
@@ -84,10 +118,14 @@ class ParamToLPC(nn.Module):
         raw_reflection = self.fc_out(x)  # Shape: (batch*time, order)
 
         # Map to reflection coefficients in (-1, 1)
-        reflection = torch.tanh(raw_reflection)  # Shape: (batch*time, order)
+        reflection = MAX_REFLECTION * torch.tanh(raw_reflection)  # Shape: (batch*time, order)
 
-        # Convert reflection coefficients to LPC coefficients using Levinson-Durbin
-        lpc_coeffs = self._levinson_durbin(reflection)  # Shape: (batch*time, order)
+        # Convert reflection coefficients to LPC coefficients using Levinson-Durbin,
+        # in float64 (see class docstring)
+        lpc_coeffs = self._levinson_durbin(reflection.double())  # Shape: (batch*time, order)
+
+        # Bandwidth expansion: pole radii r -> gamma * r
+        lpc_coeffs = lpc_coeffs * self.expansion.double()
 
         # Reshape back to (B, T, order)
         return lpc_coeffs.view(batch, time, self.order)

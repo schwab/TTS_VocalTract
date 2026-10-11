@@ -73,6 +73,50 @@ def naive_sample_wise_lpc(excitation: torch.Tensor, coeffs: torch.Tensor) -> tor
     return torch.stack(outputs, dim=-1)
 
 
+def frames_to_samples(coeffs: torch.Tensor, hop: int) -> torch.Tensor:
+    """
+    Hold frame-rate LPC coefficients constant across each frame's samples.
+
+    Direct-form LPC coefficients are *not* interpolated: a linear blend of two
+    stable coefficient sets can have poles outside the unit circle. Holding
+    each frame keeps every sample on a set the mapper guarantees is stable.
+
+    Args:
+        coeffs: Frame-rate coefficients of shape (B, T_frames, order).
+        hop: Samples per frame.
+
+    Returns:
+        Sample-rate coefficients of shape (B, T_frames * hop, order).
+    """
+    return coeffs.repeat_interleave(hop, dim=1)
+
+
+def min_response(coeffs: torch.Tensor, n_fft: int = 512) -> torch.Tensor:
+    """
+    Minimum of ``|A(e^{jw})|`` over an ``n_fft``-point frequency grid.
+
+    This is the reciprocal of the all-pole filter's peak gain. Multiplying the
+    excitation by it normalizes the filter so its strongest resonance has unit
+    gain. Multiplying (rather than dividing by :func:`peak_gain`) keeps the
+    gradient bounded: d(1/x)/dx = -1/x**2 overflows float32 for sharp
+    resonances where x ~ 1e-7.
+
+    Args:
+        coeffs: LPC coefficients of shape (..., order), ``1 - sum`` convention.
+        n_fft: Frequency-grid size; must exceed ``order``.
+
+    Returns:
+        Tensor of shape (...).
+    """
+    polynomial = torch.cat([torch.ones_like(coeffs[..., :1]), -coeffs], dim=-1)
+    return torch.fft.rfft(polynomial, n=n_fft).abs().min(dim=-1).values
+
+
+def peak_gain(coeffs: torch.Tensor, n_fft: int = 512) -> torch.Tensor:
+    """Peak magnitude response ``1 / min_w |A(e^{jw})|`` of the all-pole filter (for reporting)."""
+    return 1.0 / min_response(coeffs, n_fft).clamp_min(1e-12)
+
+
 class LPCFilter(nn.Module):
     """
     Time-varying all-pole LPC synthesis filter.
@@ -102,16 +146,23 @@ class LPCFilter(nn.Module):
             coeffs: LPC coefficients of shape (B, T, order) in the
                 ``1 - sum a_i z^{-i}`` convention (as produced by ParamToLPC).
 
+        Filtering runs at the higher precision of the two inputs, so float64
+        coefficients (as ParamToLPC produces) are never rounded to float32:
+        sharp resonances are not stable after that rounding.
+
         Returns:
             Synthesized audio of shape (B, T), same dtype as ``excitation``.
         """
         self._check_shapes(excitation, coeffs)
-        coeffs = coeffs.to(excitation.dtype)
+        compute_dtype = torch.promote_types(excitation.dtype, coeffs.dtype)
+        x, a = excitation.to(compute_dtype), coeffs.to(compute_dtype)
 
         if self.use_torchlpc:
             # torchlpc expects the 1 + sum A_i z^{-i} convention: negate.
-            return torchlpc.sample_wise_lpc(excitation, -coeffs)
-        return naive_sample_wise_lpc(excitation, coeffs)
+            y = torchlpc.sample_wise_lpc(x, -a)
+        else:
+            y = naive_sample_wise_lpc(x, a)
+        return y.to(excitation.dtype)
 
     @staticmethod
     def _check_shapes(excitation: torch.Tensor, coeffs: torch.Tensor) -> None:
