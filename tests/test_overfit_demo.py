@@ -38,9 +38,17 @@ class TestAssets:
 
 
 class TestConfig:
-    def test_default_init_depends_on_mode(self):
-        assert demo.DemoConfig(target_mode="wav").resolved_init() == "npz"
-        assert demo.DemoConfig(target_mode="self").resolved_init() == "mid"
+    def test_defaults_depend_on_mode(self):
+        wav, self_mode = demo.DemoConfig(target_mode="wav"), demo.DemoConfig(target_mode="self")
+        assert wav.resolved_init() == "npz" and self_mode.resolved_init() == "perturbed"
+        assert wav.resolved_train_mapper() and not self_mode.resolved_train_mapper()
+        assert demo.DemoConfig(target_mode="self", train_mapper=True).resolved_train_mapper()
+
+    def test_parse_freeze(self):
+        assert demo.parse_freeze("aa=0, fa") == {"aa": 0.0, "fa": None}
+        assert demo.parse_freeze("") == {}
+        with pytest.raises(ValueError):
+            demo.parse_freeze("xx=1")
 
     def test_self_mode_rejects_npz_init(self):
         with pytest.raises(ValueError):
@@ -56,6 +64,9 @@ class TestConfig:
         assert torch.all(demo.initial_params("mid", truth) == 0.5)
         rand = demo.initial_params("random", truth)
         assert rand.shape == truth.shape and 0 <= rand.min() and rand.max() <= 1
+        near = demo.initial_params("perturbed", truth, perturb=0.05)
+        assert (near - truth).abs().max() <= 0.05 + 1e-7
+        assert torch.equal(near, demo.initial_params("perturbed", truth, perturb=0.05))
 
 
 class TestRun:
@@ -63,8 +74,24 @@ class TestRun:
         result = demo.run(demo.DemoConfig(steps=30, log_every=10))
         assert len(result.history) == 31
         assert result.final_loss < result.initial_loss
+        assert result.final_loss == min(result.history)  # best step is reported
         assert result.params.min() >= 0 and result.params.max() <= 1
         assert result.diverged_at is None
+
+    def test_freeze_holds_columns(self):
+        result = demo.run(demo.DemoConfig(steps=15, freeze={"aa": 0.0, "ga": None}))
+        aa, ga = demo.PARAM_NAMES.index("aa"), demo.PARAM_NAMES.index("ga")
+        assert torch.all(result.params[..., aa] == 0.0)
+        assert torch.equal(result.params[..., ga], result.truth_params[..., ga])
+
+    def test_pitch_lr_scale_zero_freezes_pitch(self):
+        result = demo.run(demo.DemoConfig(steps=15, pitch_lr_scale=0.0))
+        gp = demo.GP_INDEX
+        assert torch.equal(result.params[..., gp], result.truth_params[..., gp])
+
+    def test_frame_params_round_trip(self):
+        start = torch.rand(1, 50, 13)
+        assert torch.equal(demo.FrameParams(start).assemble(), start)
 
     def test_synthesize_is_deterministic(self):
         """Fixed-seed noise makes synthesis repeatable, so self targets are exactly recoverable."""
@@ -76,6 +103,11 @@ class TestRun:
     def test_self_mode_reduces_loss(self):
         result = demo.run(demo.DemoConfig(target_mode="self", steps=30))
         assert result.final_loss < result.initial_loss
+
+    def test_self_mode_from_truth_is_zero_loss(self):
+        """With no perturbation the self-rendered target is matched exactly."""
+        result = demo.run(demo.DemoConfig(target_mode="self", init="perturbed", perturb=0.0, steps=1))
+        assert result.initial_loss == pytest.approx(0.0, abs=1e-6)
 
     def test_train_mapper_flag(self):
         result = demo.run(demo.DemoConfig(steps=10, train_mapper=True, lr=1e-3))
@@ -104,20 +136,32 @@ class TestMain:
             audio, sr = sf.read(path)
             assert sr == demo.SAMPLE_RATE and audio.shape == (demo.SAMPLE_RATE,)
         out = capsys.readouterr().out
-        assert "PASS" in out and "initial loss" in out and "median gp" in out
+        assert "PASS" in out and "loss: initial" in out and "median gp" in out
+        assert "log-spectral distance" in out
+
+    def test_self_mode_reports_param_error(self, out_path, capsys):
+        assert demo.main(["--target-mode", "self", "--steps", "10", "--out", str(out_path)]) in (0, 1)
+        out = capsys.readouterr().out
+        assert "param error vs truth" in out and "pitch error vs truth" in out
 
     def test_returns_1_when_loss_does_not_decrease(self, out_path, monkeypatch):
-        """lr=0 leaves params unchanged, so final == initial and the check fails."""
+        """lr=0 leaves everything unchanged, so the best loss equals the initial loss."""
         assert demo.main(["--steps", "3", "--lr", "0", "--out", str(out_path)]) == 1
 
     def test_default_run_converges(self, out_path):
-        """The full default run (500 steps) lowers the loss on average and keeps pitch near truth."""
+        """
+        The full default run (500 steps) lowers the loss on average, keeps pitch
+        near truth, and moves the spectrum substantially toward the target.
+        """
         result = demo.run(demo.DemoConfig(out=out_path))
         first, last = demo.window_trend(result.history)
         assert last < first
         assert result.final_loss < result.initial_loss
         truth_hz = demo.median_pitch_hz(result.truth_params)
-        assert abs(demo.median_pitch_hz(result.params) - truth_hz) / truth_hz < 0.05
+        assert abs(demo.median_pitch_hz(result.params) - truth_hz) / truth_hz < 0.02
+        lsd_before = demo.log_spectral_distance(result.initial_audio, result.target)
+        lsd_after = demo.log_spectral_distance(result.final_audio, result.target)
+        assert lsd_after < 0.6 * lsd_before
 
     def test_module_entry_point(self, out_path):
         proc = subprocess.run(
