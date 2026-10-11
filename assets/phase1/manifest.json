@@ -1,0 +1,65 @@
+[
+  {
+    "name": "synthetic_vowel_ah",
+    "wav": "synthetic_vowel_ah.wav",
+    "params": "synthetic_vowel_ah.npz",
+    "params_kind": "ground_truth",
+    "difficulty": 1,
+    "source": "scipy source-filter model (not VocalTract)",
+    "description": "steady /a/, f0 120 Hz, formants 730/1090/2440/3400 Hz with natural bandwidths, glottal tilt and lip radiation. ga is nominal."
+  },
+  {
+    "name": "vt_vowel_ah",
+    "wav": "vt_vowel_ah.wav",
+    "params": "vt_vowel_ah.npz",
+    "params_kind": "ground_truth",
+    "difficulty": 2,
+    "source": "vocaltract.reference engine (20 kHz -> 16 kHz)",
+    "description": "steady /a/ at 120 Hz"
+  },
+  {
+    "name": "vt_glide_ah_ee",
+    "wav": "vt_glide_ah_ee.wav",
+    "params": "vt_glide_ah_ee.npz",
+    "params_kind": "ground_truth",
+    "difficulty": 3,
+    "source": "vocaltract.reference engine (20 kHz -> 16 kHz)",
+    "description": "/a/ -> /i/ formant glide with 110 -> 150 Hz rise"
+  },
+  {
+    "name": "vt_sung_oo_vibrato",
+    "wav": "vt_sung_oo_vibrato.wav",
+    "params": "vt_sung_oo_vibrato.npz",
+    "params_kind": "ground_truth",
+    "difficulty": 3,
+    "source": "vocaltract.reference engine (20 kHz -> 16 kHz)",
+    "description": "sung /u/ at 196 Hz, vibrato 5.3 Hz +/-0.75 st (vp/vr: the Phase 1 source ignores vibrato)"
+  },
+  {
+    "name": "vt_seven",
+    "wav": "vt_seven.wav",
+    "params": "vt_seven.npz",
+    "params_kind": "ground_truth",
+    "difficulty": 4,
+    "source": "vocaltract.reference engine (20 kHz -> 16 kHz)",
+    "description": "\"seven\" from SingingDemoSeven (tenor, first note): frication (fa/ff) and nasal (na/nf), which the Phase 1 source cannot produce"
+  },
+  {
+    "name": "speech_male",
+    "wav": "speech_male.wav",
+    "params": "speech_male.npz",
+    "params_kind": "analysis",
+    "difficulty": 5,
+    "source": "assets/recordings/5703-47212-0000.ogg from 6.57 s (LibriSpeech, CC BY 4.0)",
+    "description": "\"during the summer months...\", male reader, f0 ~80 Hz. Params are level A analysis (vocaltract.analysis.resynth), an approximate initialization, not ground truth."
+  },
+  {
+    "name": "speech_female",
+    "wav": "speech_female.wav",
+    "params": "speech_female.npz",
+    "params_kind": "analysis",
+    "difficulty": 5,
+    "source": "assets/recordings/198-209-0000.ogg from 1.71 s (LibriSpeech, CC BY 4.0)",
+    "description": "\"the next morning...\", female reader, f0 ~210 Hz. Params are level A analysis (vocaltract.analysis.resynth), an approximate initialization, not ground truth."
+  }
+]
