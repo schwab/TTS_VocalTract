@@ -53,16 +53,23 @@ TTS_VocalTract/
 │       ├── mapper.py            # params -> LPC coefficients
 │       ├── filter.py            # differentiable LPC wrapper
 │       ├── source.py            # placeholder excitation (Phase 1 stub)
+│       ├── pipeline.py          # params -> mapper -> source -> filter -> audio
 │       ├── losses.py            # multi-scale STFT loss
 │       └── phase1/
 │           ├── __init__.py
 │           ├── smoke_test.py    # gradient flow check
 │           └── overfit_demo.py  # training loop on one clip
+├── assets/phase1/               # target WAV + ground-truth .npz params (see its README)
 └── tests/
     ├── test_params.py
     ├── test_mapper.py
     ├── test_filter.py
-    └── test_gradients.py
+    ├── test_source.py
+    ├── test_losses.py
+    ├── test_pipeline.py
+    ├── test_gradients.py
+    ├── test_smoke.py
+    └── test_overfit_demo.py
 ```
 
 ---
@@ -123,18 +130,26 @@ TTS_VocalTract/
 **Goal:** A small, trainable module that converts a `(B, T, 13)` tensor into LPC coefficients `(B, T, order)` while guaranteeing filter stability.
 
 **Specification:**
-- Class `ParamToLPC(nn.Module)` with `__init__(self, order: int = 10, hidden: int = 64)`.
+- Class `ParamToLPC(nn.Module)` with `__init__(self, order: int = 10, hidden: int = 64, gamma: float = 0.99)`.
 - Architecture: `Linear(13, hidden) → GELU → Linear(hidden, hidden) → GELU → Linear(hidden, order)`.
-- Output is interpreted as **reflection coefficients (PARCOR)** in `(-1, 1)` via `tanh`.
-- Convert reflection coefficients → LPC coefficients using the **Levinson–Durbin recursion**, implemented differentiably in pure PyTorch (loop over order, vectorized over batch/time).
-- Provide `forward(params: Tensor) -> Tensor` returning LPC coefficients `(B, T, order)`.
+- Output is interpreted as **reflection coefficients (PARCOR)** via `0.99 * tanh(x)`, i.e. `|k| ≤ 0.99`.
+- Convert reflection coefficients → LPC coefficients using the **Levinson–Durbin recursion**, implemented differentiably in pure PyTorch (loop over order, vectorized over batch/time). The recursion and the returned coefficients are **float64**.
+- Apply **bandwidth expansion** `a_i ← a_i · γ^i` (γ = 0.99): every pole radius is scaled by γ, so the narrowest resonance is ~51 Hz wide at 16 kHz.
+- Provide `forward(params: Tensor) -> Tensor` returning float64 LPC coefficients `(B, T, order)`.
 - Include a `to_reflection` helper and the inverse for tests.
 
 **Why reflection coefficients:** guarantees pole stability by construction, and is a well-trodden path in the GOLF codebase.
 
+**Why the cap, float64 and γ (revision):** "stable by construction" holds in exact arithmetic only. Measured during Step 7:
+- `tanh` saturates to exactly ±1 in float32 at large pre-activations; `|k| = 1` puts a repeated root on the unit circle.
+- Direct-form coefficients rounded to float32 realize an unstable filter once `|k|` exceeds ~0.9; float64 is exact at 0.99.
+- Without γ, poles can sit arbitrarily close to the unit circle and the filter gain explodes; training the mapper at lr ≥ 1e-2 produced NaN. With all three fixes it trains without NaN up to lr 1e-1.
+
+**Gain normalization** (in `pipeline.py`, not the mapper): the excitation is multiplied per frame by `min_ω |A(e^{jω})|` (`filter.min_response`), so the filter's peak gain is 1 and output level follows `ga`. Multiplying by the minimum rather than dividing by the peak keeps the gradient bounded.
+
 **Expected Output:**
 - `mapper = ParamToLPC(); A = mapper(torch.rand(2, 50, 13))` returns shape `(2, 50, 10)`.
-- All poles lie strictly inside the unit circle (verified in `test_mapper.py` by checking the roots of the LPC polynomial for a batch of random inputs).
+- All poles lie strictly inside the unit circle, with radius ≤ γ (verified in `test_mapper.py` by checking the roots of the LPC polynomial for a batch of random inputs, including saturated ones).
 - Gradients flow through `mapper` — `A.sum().backward()` populates `mapper` parameter grads.
 
 ---
@@ -150,6 +165,8 @@ TTS_VocalTract/
 - `excitation`: `(B, T)` — the source signal.
 - `coeffs`: `(B, T, order)` — time-varying LPC coefficients.
 - Inside, call `torchlpc.sample_wise_lpc(excitation, coeffs)`.
+- `torchlpc` uses the `1 + Σ A_i z^{-i}` sign convention; the mapper uses `1 − Σ a_i z^{-i}`, so the wrapper negates the coefficients.
+- Filter at the higher precision of the two inputs (float64 when the mapper's coefficients are float64); return the excitation's dtype.
 - Zero initial state for Phase 1.
 - Add `@torch.no_grad()` helper `analyze(audio, order)` using `torchlpc.lpc` for reference comparison only.
 - Docstring must explicitly note that `torchlpc` uses efficient custom kernels and provides gradients through a reverse filtering operation.
@@ -169,9 +186,15 @@ TTS_VocalTract/
 **Specification:**
 - Function `make_excitation(params: Tensor, sample_rate: int = 16000, hop: int = 320) -> Tensor`.
 - Input: `(B, T_frames, 13)`; output: `(B, T_frames * hop)`.
-- For Phase 1: generate a **sine-based periodic source** at the frequency given by `denormalize(params)["glottal_pitch"]`, plus a white-noise component scaled by `aspiration`.
-- Use `torch.cumsum` on the instantaneous frequency to keep phase continuity, and `torch.sin` for the carrier — both differentiable.
+- For Phase 1: generate a **band-limited harmonic source** at the frequency given by `denormalize(params)["gp"]`, scaled by `ga`, plus a white-noise component scaled by `aa`.
+  - Harmonic sum `(2/π) Σ_k sin(k φ) / k` (a band-limited sawtooth, 1/k spectral tilt) with every harmonic up to Nyquist.
+  - Each harmonic fades out linearly over the last 500 Hz below Nyquist, so harmonics enter and leave smoothly as pitch changes and nothing aliases.
+  - `max_harmonics=1` reproduces the original single-sine source.
+- Use `torch.cumsum` on the instantaneous frequency to keep phase continuity (wrapped to [0, 1) cycles), and `torch.sin` for the carriers — both differentiable.
 - Interpolate frame-level parameters to sample-level using `F.interpolate(mode="linear")`.
+- Accept an optional `torch.Generator` for the noise so synthesis is repeatable.
+
+**Why harmonics (revision):** a pure sine has energy only at f0. The all-pole filter can only reshape energy that is present, so a sine-driven model could not produce the harmonic series of any target; the optimizer substituted aspiration noise instead.
 
 **Expected Output:**
 - Output shape `(B, T_frames * hop)`.
@@ -206,7 +229,7 @@ TTS_VocalTract/
 
 **Specification:**
 - Build `params = torch.rand(1, 50, 13, requires_grad=True)`.
-- Run `params → mapper → source → filter → audio`.
+- Run `params → mapper → source → filter → audio` via `vocaltract.pipeline.synthesize_trace` (the same chain the demo trains through).
 - Compute `loss = audio.pow(2).mean()`.
 - Call `loss.backward()`.
 - Assert `params.grad is not None` and `params.grad.abs().sum() > 0`.
@@ -225,20 +248,36 @@ TTS_VocalTract/
 **Goal:** Train the parameter tensor (and mapper) to reconstruct a fixed target audio clip. This is the Phase 1 “hello world”.
 
 **Specification:**
-- Load or synthesize a target: use a 1-second, 16 kHz clip. Either:
-  - (a) synthesize a target with the same pipeline using fixed ground-truth params, or
-  - (b) load any short WAV from `assets/` (create the folder, add a placeholder if empty).
-- Trainable objects: `params` (the free variable) and `mapper` (optional; configurable via flag).
-- Optimizer: `Adam(lr=1e-3)`.
-- Loss: `MultiScaleSTFTLoss` + small L1 on the waveform.
+- Load or synthesize a target: use a 1-second, 16 kHz clip from `assets/phase1` (`--target`, default `vt_vowel_ah`). Either:
+  - (a) `--target-mode self`: synthesize the target with the same pipeline from the clip's ground-truth `.npz` params and a frozen fixed-seed mapper; start from the truth perturbed by `--perturb` (default 0.05) and report parameter and pitch error before/after, or
+  - (b) `--target-mode wav` (default): load the target WAV; start from its `.npz` params.
+- Trainable objects: `params` (the free variable) and `mapper` (`--train-mapper/--no-train-mapper`; default on for WAV targets, off for self targets).
+- `params` are optimized directly and clamped to [0, 1] after each step (projected gradient descent). A sigmoid parameterization cannot reach the many exact zeros in the targets.
+- `--freeze name[=value],...` holds parameters fixed, e.g. `--freeze aa=0` removes aspiration noise.
+- Optimizer: `Adam(lr=1e-3)`, with pitch (`gp`) at `lr × 0.1` (`--pitch-lr-scale`) and cosine learning-rate decay (`--no-lr-decay` to disable). The best step is kept.
+- Loss: `MultiScaleSTFTLoss` + `0.1 ×` L1 on the waveform. Noise uses a fixed seed every step.
 - Loop for a configurable number of steps (default 500), logging loss every 50 steps.
-- Save the final prediction to `out/phase1_overfit.wav`.
-- Print initial and final loss; assert final < initial.
+- Save the best prediction to `out/phase1_overfit.wav`, plus `_target.wav` and `_initial.wav` for listening.
+- Print initial and best loss, log-spectral distance (LSD) to the target before/after, and median pitch. Exit 0 if the loss decreased, 1 if not or on divergence, 2 on a bad configuration.
 
 **Expected Output:**
-- `python -m vocaltract.phase1.overfit_demo` runs to completion in under 2 minutes on CPU.
+- `python -m vocaltract.phase1.overfit_demo` runs to completion in under 2 minutes on CPU (16–32 s measured).
 - `out/phase1_overfit.wav` is written and its STFT visually resembles the target (manual check).
-- Loss curve is monotonically decreasing on average.
+- Loss curve is decreasing on average (windowed trend); LSD falls to under 0.6× its starting value; median pitch ends within 2% of the target's.
+
+**Measured results** (default settings, LSD in dB, lower is better):
+
+| Target | Start | After 500 steps |
+|---|---|---|
+| synthetic_vowel_ah | 37.3 | 12.1 |
+| vt_vowel_ah | 35.8 | 15.7 |
+| vt_glide_ah_ee | 39.4 | 13.6 |
+| vt_sung_oo_vibrato | 33.7 | 13.7 |
+| vt_seven | 36.3 | 11.8 |
+| speech_male | 26.3 | 12.7 |
+| speech_female | 27.6 | 10.5 |
+
+Pitch ends within 0.8 Hz of the target on every clip.
 
 ---
 
@@ -261,7 +300,7 @@ TTS_VocalTract/
   - With near-zero coefficients, output ≈ input (within tolerance).
 - `test_gradients.py`
   - End-to-end `params → audio → scalar loss` produces non-zero gradients on `params`.
-  - One optimizer step reduces the loss on a fixed seed.
+  - One optimizer step reduces the loss on a fixed seed (with `gp` held fixed: pitch only enters through the cumulative phase, so its gradient is linear only over a tiny step).
 
 **Expected Output:**
 - `pytest -q` passes all tests in under 60 seconds on CPU.
@@ -298,6 +337,14 @@ TTS_VocalTract/
 
 ---
 
+## Known Limitations (found in Step 7)
+
+- **Parameters are not identifiable through the MLP mapper.** In self-target mode the loss falls but parameter error grows (0.018 → 0.036 mean absolute error at `--perturb 0.05`); pitch error improves only from 32 to 27 cents. The mapper sees all 13 parameters, including ones Phase 1 does not model (`na`, `nf`, `ff`, `fa`), and a random network has no reason to place resonances at `f1`–`f4`, so many parameter settings sound alike. Fixing this needs a physically grounded mapper (formant frequencies → resonators), not more optimization.
+- **Harmonic energy is still short of the targets** (about a third on `vt_vowel_ah`, measured before the final mapper and loss fixes). Likely the same cause: the learned filter shape, not the source.
+- **Pitch is only locally learnable.** Phase is a running sum of frequency, so a pitch error compounds over the clip; from a neutral start, pitch gets stuck in local minima of the spectral loss. Demos start from the target's `.npz` params.
+
+---
+
 ## Explicit Non-Goals for Phase 1
 
 To keep scope tight, Phase 1 does **not** include:
@@ -320,7 +367,3 @@ Any of these appearing in Phase 1 PRs should be deferred.
 - Every public function gets type hints.
 - Set `torch.manual_seed(0)` in demos and tests for reproducibility.
 - If `torchlpc` is unavailable on the target platform, fall back to a naive differentiable IIR implementation in `filter.py` behind a feature flag, and document the performance caveat.
-
----
-
-Want me to also draft the **Phase 2 task document** (glottal source model) so you can see how Phase 1's stubs are meant to be replaced?
