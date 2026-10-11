@@ -1,7 +1,20 @@
 """
-Side-by-side spectrogram comparison of audio files, as a self-contained HTML page.
+Side-by-side spectrogram comparison of audio files, in the browser.
 
-Writes one HTML file (no server, no network) with:
+Two ways to run it:
+
+- **static page**: one self-contained HTML file (no server, no network) for a
+  fixed list of files. ``vocaltract.analysis.resynth`` writes one of these per
+  input (``<name>_compare.html``).
+- **folder browser** (``--serve DIR``): a small local web server. Every track
+  has a menu of the audio files under ``DIR`` (searched recursively), so you
+  can load, swap, add and remove tracks from the page. Spectrograms and Praat
+  tracks are computed when you pick a file. A frames menu lists
+  ``*_frames.csv`` files, and each track has a **words** button (Whisper
+  timings, plus WER when a ``<stem>.txt`` transcript sits next to the file).
+  The selection is kept in the URL, so reloading or bookmarking restores it.
+
+Both show:
 
 - **linked spectrograms**, one pane per file, on identical settings: the same
   frequency range, window and dB floor, each normalized to its own peak so a
@@ -17,22 +30,28 @@ Writes one HTML file (no server, no network) with:
   file (formants shown on voiced frames only), and **Whisper word timings**
 - **URL options** for shareable views:
   ``#t0=2&t1=4&res=narrow&floor=-60&fmax=5000&diff=1&praat=1&frames=0&words=0``
-- a **difference** pane (2nd file minus 1st, in dB) when comparing two files
+  (folder browser: also ``files=a.wav,b.wav&framesfile=x_frames.csv``)
+- a **difference** pane (track 2 minus track 1, in dB)
 
 Usage::
 
     python -m vocaltract.analysis.compare original.wav resynth.wav \\
         --frames out/resynth/x_frames.csv --words -o out/compare.html
 
-``vocaltract.analysis.resynth`` writes one of these per input automatically
-(``<name>_compare.html``). ``--sv-dir`` also exports the overlays as CSV
-layers for Sonic Visualiser (File > Import Annotation Layer).
+    python -m vocaltract.analysis.compare --serve out/     # folder browser
+    python -m vocaltract.analysis.compare --serve . assets/phase1/vt_vowel_ah.wav
+
+``--sv-dir`` also exports the overlays as CSV layers for Sonic Visualiser
+(File > Import Annotation Layer).
 """
 
 import argparse
 import base64
 import io
 import json
+import os
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -44,7 +63,11 @@ from ..params import FORMANT_SCALE, PARAM_NAMES
 RESOLUTIONS = {"wide": (0.005, 0.002, 256), "narrow": (0.035, 0.005, 512)}
 FLOOR_DB = -100.0          # stored range; the page's slider picks the display floor
 DIFF_RANGE_DB = 40.0       # difference pane spans +/- this
+DIFF_QUIET_DB = -70.0      # silent in both files -> shown as equal
 MAX_COLUMNS = 12_000       # longer files get a coarser hop
+SERVE_FMAX = 8000.0        # folder browser's top frequency (16 kHz Nyquist)
+AUDIO_EXTS = {".wav", ".flac", ".ogg", ".mp3", ".aif", ".aiff"}
+_SKIP_DIRS = {"__pycache__", "node_modules", "venv", "site-packages"}
 GP_INDEX, GA_INDEX, AA_INDEX, FA_INDEX = (PARAM_NAMES.index(n) for n in ("gp", "ga", "aa", "fa"))
 F1_INDEX = PARAM_NAMES.index("f1")
 
@@ -88,7 +111,7 @@ def spectrogram(audio: np.ndarray, sr: int, window_s: float, hop_s: float, fmax:
     """Power spectrogram in dB re its own peak, ``(n_rows, n_cols)``, low frequency first.
 
     Column k is centred at ``k * hop_s``; columns past the end of the audio
-    sit at the floor.
+    (and rows above the file's Nyquist) sit at the floor.
     """
     x = np.asarray(audio, dtype=np.float64)
     nper = max(16, int(round(window_s * sr)))
@@ -118,21 +141,26 @@ def encode_db(db: np.ndarray) -> str:
     return _png_b64(np.round((db - FLOOR_DB) / -FLOOR_DB * 255).astype(np.uint8))
 
 
-def encode_diff(db_a: np.ndarray, db_b: np.ndarray, quiet_db: float = -70.0) -> str:
-    """8-bit PNG of ``b - a`` in dB, 128 = equal; silent in both -> equal."""
-    d = np.where(np.maximum(db_a, db_b) < quiet_db, 0.0, db_b - db_a)
-    gray = 128 + np.clip(d / DIFF_RANGE_DB, -1, 1) * 127
-    return _png_b64(np.round(gray).astype(np.uint8))
+def clip_spectrograms(clip: Clip, fmax: float) -> dict:
+    """Both views of one clip on its own time grid: ``{res: {hop, cols, rows, png}}``."""
+    out = {}
+    for res, (window, hop, n_rows) in RESOLUTIONS.items():
+        hop = max(hop, clip.duration / MAX_COLUMNS)
+        n_cols = int(np.ceil(clip.duration / hop)) + 1
+        db = spectrogram(clip.audio, clip.sr, window, hop, fmax, n_cols, n_rows)
+        out[res] = {"hop": hop, "cols": n_cols, "rows": n_rows, "png": encode_db(db)}
+    return out
 
 
-def _wav_b64(audio: np.ndarray, sr: int) -> str:
+def wav_bytes(audio: np.ndarray, sr: int) -> bytes:
+    """16-bit WAV, peak-normalized to 0.9."""
     import soundfile as sf
 
     x = np.asarray(audio, dtype=np.float64)
-    peak = np.abs(x).max()
+    peak = np.abs(x).max() if len(x) else 0
     buf = io.BytesIO()
     sf.write(buf, x * (0.9 / peak) if peak > 0 else x, sr, format="WAV", subtype="PCM_16")
-    return base64.b64encode(buf.getvalue()).decode("ascii")
+    return buf.getvalue()
 
 
 def _lut(name: str) -> list[list[int]]:
@@ -147,7 +175,7 @@ def _clean(values, digits: int = 1) -> list:
 
 
 # ---------------------------------------------------------------------------
-# page
+# page data
 # ---------------------------------------------------------------------------
 
 def praat_tracks(clip: Clip, hop: float = 0.01) -> dict:
@@ -175,50 +203,48 @@ def frames_overlay(frames: np.ndarray, times: np.ndarray) -> dict:
 
 def load_frames_csv(path: Path) -> tuple[np.ndarray, np.ndarray]:
     """``<name>_frames.csv`` from resynth -> (frames (N, 13), times (N,))."""
-    data = np.genfromtxt(path, delimiter=",", names=True)
+    data = np.atleast_1d(np.genfromtxt(path, delimiter=",", names=True))
     return np.stack([data[n] for n in PARAM_NAMES], axis=1), data["time_s"]
+
+
+def clip_payload(clip: Clip, fmax: float, *, praat: bool = True, words: list[dict] | None = None,
+                 embed_audio: bool = True) -> dict:
+    """Everything the page needs for one track."""
+    return {
+        "name": clip.name, "note": clip.note, "sr": clip.sr, "duration": clip.duration,
+        "audio": base64.b64encode(wav_bytes(clip.audio, clip.sr)).decode("ascii") if embed_audio else None,
+        "spec": clip_spectrograms(clip, fmax),
+        "words": words or [],
+        "praat": praat_tracks(clip) if praat else None,
+    }
+
+
+def _page_data(title: str, fmax: float, clips: list[dict], frames: dict | None,
+               serve: dict | None = None) -> dict:
+    return {
+        "title": title, "fmax": fmax, "floorStored": FLOOR_DB, "diffRange": DIFF_RANGE_DB,
+        "quietDb": DIFF_QUIET_DB, "lut": {"magma": _lut("magma"), "diverging": _lut("RdBu_r")},
+        "clips": clips, "frames": frames, "serve": serve,
+    }
+
+
+def _render(data: dict) -> str:
+    blob = json.dumps(data, separators=(",", ":")).replace("</", "<\\/")
+    return _TEMPLATE.replace("__TITLE__", _html_escape(data["title"])).replace("__DATA__", blob)
 
 
 def build_page(clips: list[Clip], *, frames: np.ndarray | None = None,
                frame_times: np.ndarray | None = None, words: list[list[dict]] | None = None,
                praat: bool = True, fmax: float | None = None, title: str = "Spectrogram comparison") -> str:
-    """Render the comparison page as an HTML string."""
+    """Render a self-contained comparison page as an HTML string."""
     if not clips:
         raise ValueError("need at least one clip")
     fmax = float(fmax or min(c.sr for c in clips) / 2)
-    duration = max(c.duration for c in clips)
-
-    grid, specs = {}, [dict() for _ in clips]
-    raw = [dict() for _ in clips]
-    for res, (window, hop, n_rows) in RESOLUTIONS.items():
-        hop = max(hop, duration / MAX_COLUMNS)
-        n_cols = int(np.ceil(duration / hop)) + 1
-        grid[res] = {"hop": hop, "cols": n_cols, "rows": n_rows, "window": window}
-        for i, c in enumerate(clips):
-            raw[i][res] = spectrogram(c.audio, c.sr, window, hop, fmax, n_cols, n_rows)
-            specs[i][res] = encode_db(raw[i][res])
-
-    data = {
-        "title": title,
-        "duration": duration,
-        "fmax": fmax,
-        "floorStored": FLOOR_DB,
-        "diffRange": DIFF_RANGE_DB,
-        "grid": grid,
-        "lut": {"magma": _lut("magma"), "diverging": _lut("RdBu_r")},
-        "clips": [{
-            "name": c.name, "note": c.note, "sr": c.sr, "duration": c.duration,
-            "audio": _wav_b64(c.audio, c.sr), "spec": specs[i],
-            "words": (words[i] if words and i < len(words) and words[i] else []),
-            "praat": praat_tracks(c) if praat else None,
-        } for i, c in enumerate(clips)],
-        "diff": ({res: encode_diff(raw[0][res], raw[1][res]) for res in RESOLUTIONS}
-                 if len(clips) == 2 else None),
-        "frames": frames_overlay(frames, frame_times) if frames is not None else None,
-    }
-    blob = json.dumps(data, separators=(",", ":")).replace("</", "<\\/")
-    return (_TEMPLATE.replace("__TITLE__", _html_escape(title))
-            .replace("__DATA__", blob))
+    payloads = [clip_payload(c, fmax, praat=praat,
+                             words=words[i] if words and i < len(words) else None)
+                for i, c in enumerate(clips)]
+    overlay = frames_overlay(frames, frame_times) if frames is not None else None
+    return _render(_page_data(title, fmax, payloads, overlay))
 
 
 def _html_escape(s: str) -> str:
@@ -253,9 +279,178 @@ def export_sv_layers(out_dir: Path, clips: list[Clip], frames: np.ndarray | None
     return paths
 
 
+# ---------------------------------------------------------------------------
+# folder browser (--serve)
+# ---------------------------------------------------------------------------
+
+def list_files(root: Path, limit: int = 5000) -> dict:
+    """Audio files and ``*_frames.csv`` under ``root`` (relative POSIX paths, sorted)."""
+    audio, frames = [], []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith(".") and d not in _SKIP_DIRS)
+        for f in sorted(filenames):
+            rel = (Path(dirpath) / f).relative_to(root).as_posix()
+            if Path(f).suffix.lower() in AUDIO_EXTS:
+                audio.append(rel)
+            elif f.endswith("_frames.csv"):
+                frames.append(rel)
+        if len(audio) + len(frames) >= limit:
+            break
+    return {"audio": audio, "frames": frames}
+
+
+class CompareServer:
+    """Serves the comparison page for the files under ``root``, computing tracks on demand."""
+
+    def __init__(self, root: Path, *, fmax: float = SERVE_FMAX, praat: bool = True,
+                 asr_model: str = "small.en", title: str | None = None, cache_size: int = 64):
+        self.root = root.resolve()
+        self.fmax = float(fmax)
+        self.praat = praat
+        self.asr_model = asr_model
+        self.title = title or f"Compare: {self.root.name or self.root}"
+        self._cache: OrderedDict = OrderedDict()
+        self._cache_size = cache_size
+        self._lock = threading.Lock()
+
+    def resolve(self, rel: str) -> Path:
+        """A file under root; anything else (missing, outside root) is FileNotFoundError."""
+        p = (self.root / rel).resolve()
+        if not rel or not p.is_relative_to(self.root) or not p.is_file():
+            raise FileNotFoundError(rel)
+        return p
+
+    def _cached(self, kind: str, rel: str, compute):
+        p = self.resolve(rel)
+        key = (kind, str(p), p.stat().st_mtime_ns)
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                return self._cache[key]
+        value = compute(p)
+        with self._lock:
+            self._cache[key] = value
+            while len(self._cache) > self._cache_size:
+                self._cache.popitem(last=False)
+        return value
+
+    def _clip(self, p: Path) -> Clip:
+        return load_clip(p, p.stem)
+
+    def page(self, initial: list[str] = (), frames: str = "") -> str:
+        serve = {"files": list_files(self.root), "initial": list(initial), "framesFile": frames,
+                 "root": str(self.root)}
+        return _render(_page_data(self.title, self.fmax, [], None, serve))
+
+    def clip(self, rel: str) -> dict:
+        return self._cached("clip", rel, lambda p: clip_payload(
+            self._clip(p), self.fmax, praat=self.praat, embed_audio=False))
+
+    def audio(self, rel: str) -> bytes:
+        return self._cached("audio", rel, lambda p: wav_bytes(*(lambda c: (c.audio, c.sr))(self._clip(p))))
+
+    def frames(self, rel: str) -> dict:
+        return self._cached("frames", rel, lambda p: frames_overlay(*load_frames_csv(p)))
+
+    def words(self, rel: str) -> dict:
+        def compute(p: Path) -> dict:
+            from .intelligibility import reference_for, transcribe_words, word_error_rate
+
+            clip = self._clip(p)
+            text, words = transcribe_words(clip.audio, clip.sr, self.asr_model)
+            ref = reference_for(p)
+            note = f"WER {word_error_rate(ref, text).wer:.0%}" if ref else ""
+            return {"text": text, "words": words, "note": note}
+        return self._cached("words", rel, compute)
+
+    def make_handler(self, initial: list[str], frames: str):
+        from http.server import BaseHTTPRequestHandler
+        from urllib.parse import parse_qs, urlparse
+
+        app = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                url = urlparse(self.path)
+                rel = parse_qs(url.query).get("path", [""])[0]
+                try:
+                    if url.path in ("/", "/index.html"):
+                        self._send(200, "text/html; charset=utf-8", app.page(initial, frames).encode())
+                    elif url.path == "/api/files":
+                        self._json(list_files(app.root))
+                    elif url.path == "/api/clip":
+                        self._json(app.clip(rel))
+                    elif url.path == "/api/audio":
+                        self._send(200, "audio/wav", app.audio(rel))
+                    elif url.path == "/api/frames":
+                        self._json(app.frames(rel))
+                    elif url.path == "/api/words":
+                        self._json(app.words(rel))
+                    else:
+                        self._json({"error": "not found"}, 404)
+                except FileNotFoundError:
+                    self._json({"error": f"no such file under {app.root}: {rel}"}, 404)
+                except Exception as e:      # report to the page instead of dropping the connection
+                    self.log_error("%s %s: %r", url.path, rel, e)
+                    self._json({"error": f"{type(e).__name__}: {e}"}, 500)
+
+            def _send(self, code: int, ctype: str, body: bytes):
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _json(self, obj, code: int = 200):
+                self._send(code, "application/json", json.dumps(obj, separators=(",", ":")).encode())
+
+            def log_message(self, fmt, *args):     # quiet; errors still go through log_error
+                pass
+
+            def log_error(self, fmt, *args):
+                print("compare server:", fmt % args, flush=True)
+
+        return Handler
+
+
+def serve(root: Path, initial: list[Path] = (), *, frames: Path | None = None, port: int = 8765,
+          open_browser: bool = True, **kwargs) -> None:
+    """Run the folder browser on http://127.0.0.1:port/ until interrupted."""
+    from http.server import ThreadingHTTPServer
+
+    app = CompareServer(root, **kwargs)
+
+    def rel(p: Path) -> str:
+        return p.resolve().relative_to(app.root).as_posix()
+
+    handler = app.make_handler([rel(p) for p in initial], rel(frames) if frames else "")
+    try:
+        httpd = ThreadingHTTPServer(("127.0.0.1", port), handler)
+    except OSError:                          # port taken: let the OS pick one
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    url = f"http://127.0.0.1:{httpd.server_address[1]}/"
+    n = len(list_files(app.root)["audio"])
+    print(f"Comparing {n} audio files under {app.root}\n  open {url}  (Ctrl+C to stop)", flush=True)
+    if open_browser:
+        import webbrowser
+        webbrowser.open(url)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="Side-by-side spectrogram comparison page")
-    ap.add_argument("inputs", nargs="+", type=Path, help="audio files, top to bottom")
+    ap.add_argument("inputs", nargs="*", type=Path,
+                    help="audio files, top to bottom (with --serve: the tracks to start with)")
+    ap.add_argument("--serve", type=Path, nargs="?", const=Path("."), metavar="DIR",
+                    help="run a local folder browser over DIR (default .) instead of writing a page")
+    ap.add_argument("--port", type=int, default=8765, help="--serve port (default 8765)")
+    ap.add_argument("--no-browser", action="store_true", help="--serve: don't open a browser")
     ap.add_argument("-o", "--out", type=Path, default=Path("out") / "compare.html")
     ap.add_argument("--names", help="comma-separated display names")
     ap.add_argument("--frames", type=Path, help="resynth <name>_frames.csv to overlay")
@@ -264,10 +459,19 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--no-praat", action="store_true", help="skip Praat pitch/formant tracks")
     ap.add_argument("--start", type=float, default=0.0, help="trim: start time (s), all files")
     ap.add_argument("--duration", type=float, help="trim: length (s)")
-    ap.add_argument("--fmax", type=float, help="top frequency (default: lowest Nyquist)")
+    ap.add_argument("--fmax", type=float,
+                    help=f"top frequency (default: lowest Nyquist; --serve: {SERVE_FMAX:.0f})")
     ap.add_argument("--title", help="page title")
     ap.add_argument("--sv-dir", type=Path, help="also export overlays as Sonic Visualiser CSV layers")
     args = ap.parse_args(argv)
+
+    if args.serve is not None:
+        serve(args.serve, args.inputs, frames=args.frames, port=args.port,
+              open_browser=not args.no_browser, fmax=args.fmax or SERVE_FMAX,
+              praat=not args.no_praat, asr_model=args.asr, title=args.title)
+        return
+    if not args.inputs:
+        ap.error("give audio files, or --serve DIR")
 
     names = args.names.split(",") if args.names else [None] * len(args.inputs)
     clips = [load_clip(p, n, args.start, args.duration) for p, n in zip(args.inputs, names)]
@@ -300,9 +504,9 @@ _TEMPLATE = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>__TITLE__</title>
 <style>
-:root{--bg:#f5f5f3;--panel:#ffffff;--text:#1c1c1e;--muted:#6a6a70;--border:#d8d8dd;--accent:#2f6fde;--axis:#5a5a60;--grid:rgba(0,0,0,.08)}
-@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#121214;--panel:#1b1b1e;--text:#ececef;--muted:#9898a0;--border:#323237;--accent:#6aa0ff;--axis:#a2a2aa;--grid:rgba(255,255,255,.08)}}
-:root[data-theme="dark"]{--bg:#121214;--panel:#1b1b1e;--text:#ececef;--muted:#9898a0;--border:#323237;--accent:#6aa0ff;--axis:#a2a2aa;--grid:rgba(255,255,255,.08)}
+:root{--bg:#f5f5f3;--panel:#ffffff;--text:#1c1c1e;--muted:#6a6a70;--border:#d8d8dd;--accent:#2f6fde;--axis:#5a5a60;--grid:rgba(0,0,0,.08);--empty:#e9e9ec;--err:#c0392b}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#121214;--panel:#1b1b1e;--text:#ececef;--muted:#9898a0;--border:#323237;--accent:#6aa0ff;--axis:#a2a2aa;--grid:rgba(255,255,255,.08);--empty:#232327;--err:#ff7b6b}}
+:root[data-theme="dark"]{--bg:#121214;--panel:#1b1b1e;--text:#ececef;--muted:#9898a0;--border:#323237;--accent:#6aa0ff;--axis:#a2a2aa;--grid:rgba(255,255,255,.08);--empty:#232327;--err:#ff7b6b}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
 header{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid var(--border);padding:10px 16px;display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center}
@@ -310,21 +514,25 @@ header h1{font-size:15px;margin:0 8px 0 0;font-weight:650}
 .group{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
 label{color:var(--muted);font-size:13px;display:flex;gap:5px;align-items:center}
 select,input[type=range]{accent-color:var(--accent)}
-select{background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:3px 6px;font:inherit;font-size:13px}
+select{background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:3px 6px;font:inherit;font-size:13px;max-width:100%}
 button{background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px 10px;font:inherit;font-size:13px;cursor:pointer}
+button:disabled{opacity:.5;cursor:default}
 button.active{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent)}
+button.icon{padding:2px 8px;color:var(--muted)}
 button .k{color:var(--muted);font-size:11px;margin-left:4px}
 main{padding:4px 0 8px}
 .pane{margin:8px 16px;background:var(--panel);border:1px solid var(--border);border-radius:8px;overflow:hidden}
-.pane .head{display:flex;gap:10px;align-items:baseline;padding:6px 10px 2px;font-size:13px}
+.pane .head{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:6px 10px 4px;font-size:13px}
 .pane .head b{font-weight:650}
+.pane .head select.file{min-width:0;flex:0 1 420px}
 .pane .head .note{color:var(--muted)}
+.pane .head .note.err{color:var(--err)}
 .pane .head .legend{margin-left:auto;color:var(--muted);font-size:12px;display:flex;gap:10px;flex-wrap:wrap}
 .sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:-1px;box-shadow:0 0 0 1px var(--border)}
 canvas{display:block;width:100%;touch-action:none;cursor:grab}
 canvas.dragging{cursor:grabbing}
 .help{color:var(--muted);font-size:12px;margin:4px 16px 18px}
-.hidden{display:none}
+.hidden{display:none !important}
 </style>
 </head>
 <body>
@@ -342,125 +550,243 @@ canvas.dragging{cursor:grabbing}
     <label id="lblWords"><input type="checkbox" id="ovWords" checked> words</label>
     <label id="lblDiff"><input type="checkbox" id="ovDiff"> difference</label>
   </div>
+  <div class="group" id="serveControls">
+    <button id="addTrack" title="add a track">+ track</button>
+    <label>Frames file <select id="framesFile"></select></label>
+    <button id="rescan" class="icon" title="rescan the folder for new files">↻ rescan</button>
+  </div>
 </header>
 <main id="panes"></main>
-<p class="help">URL options: <code>#t0=2&amp;t1=4&amp;res=narrow&amp;floor=-60&amp;fmax=5000&amp;diff=1&amp;praat=1&amp;words=0</code> &middot; Wheel or pinch: zoom &middot; drag: pan &middot; double-click: whole file &middot; click: move playhead &middot; <b>space</b>: play/pause &middot; <b>1&ndash;9</b>: switch file at the same moment (A/B) &middot; <b>&larr;/&rarr;</b>: step 0.5 s</p>
+<p class="help"><span id="serveHelp">Pick a file in each track's menu &middot; </span>URL options: <code>#t0=2&amp;t1=4&amp;res=narrow&amp;floor=-60&amp;fmax=5000&amp;diff=1&amp;praat=1&amp;words=0</code> &middot; Wheel or pinch: zoom &middot; drag: pan &middot; double-click: whole file &middot; click: move playhead &middot; <b>space</b>: play/pause &middot; <b>1&ndash;9</b>: switch track at the same moment (A/B) &middot; <b>&larr;/&rarr;</b>: step 0.5 s</p>
 <script type="application/json" id="data">__DATA__</script>
 <script>
 "use strict";
 const D = JSON.parse(document.getElementById("data").textContent);
+const SERVE = !!D.serve;
+const RES = ["wide", "narrow"];
 const L = 46, R = 10;                      // plot margins (css px)
 const SPEC_H = 220, WORDS_H = 22, AXIS_H = 18, LANE_H = 110;
 const CLIP_COLORS = ["#ffb000", "#35d0ff", "#ff5fa2", "#8ee05a", "#c08bff", "#ff7b39"];
-const state = {t0: 0, t1: D.duration, res: "wide", floor: -70, fmax: D.fmax, active: 0, cursor: 0,
+const state = {t0: 0, t1: 1, res: "wide", floor: -70, fmax: D.fmax, active: 0, cursor: 0,
                ovFrames: true, ovPraat: false, ovWords: true, ovDiff: false};
 const $ = id => document.getElementById(id);
+const el = (tag, props = {}, ...kids) => { const e = Object.assign(document.createElement(tag), props); e.append(...kids); return e; };
 document.title = D.title; $("title").textContent = D.title;
 
-// ---------- audio ----------
-const audios = D.clips.map(c => { const a = new Audio("data:audio/wav;base64," + c.audio); a.preload = "auto"; return a; });
-const playing = () => !audios[state.active].paused;
-function nowT() { return playing() ? audios[state.active].currentTime : state.cursor; }
-function switchTo(i, play) {
-  const t = nowT(), wasPlaying = playing();
-  audios[state.active].pause();
-  state.active = i; state.cursor = Math.min(t, D.clips[i].duration);
-  audios[i].currentTime = state.cursor;
-  if (play ?? wasPlaying) audios[i].play();
-  updateButtons(); dirty = true;
-}
-function togglePlay() {
-  const a = audios[state.active];
-  if (a.paused) { if (state.cursor >= D.clips[state.active].duration - 0.01) state.cursor = 0; a.currentTime = state.cursor; a.play(); }
-  else { a.pause(); state.cursor = a.currentTime; }
-  updateButtons();
-}
-function seek(t) {
-  state.cursor = Math.max(0, Math.min(t, D.clips[state.active].duration));
-  audios[state.active].currentTime = state.cursor; dirty = true;
-}
-audios.forEach((a, i) => { a.addEventListener("ended", () => { state.cursor = D.clips[i].duration; updateButtons(); dirty = true; }); });
+// A track: {path, name, note, sr, duration, audio (Audio), gray {res: {w,h,g,hop}}, colored {res: canvas},
+//           praat, words, loading, error}. A track with no file loaded has no `gray`.
+let tracks = [], frames = D.frames, framesPath = "", files = SERVE ? D.serve.files : {audio: [], frames: []};
+let duration = 1, diffImg = {}, pitchRange = null, dirty = true;
+const loaded = t => !!(t && t.gray);
+const basename = p => p.split("/").pop().replace(/\.[^.]+$/, "");
 
-const btns = D.clips.map((c, i) => {
-  const b = document.createElement("button");
-  b.innerHTML = `<span class="sw" style="background:${CLIP_COLORS[i % 6]}"></span><span class="lbl"></span><span class="k">${i + 1}</span>`;
-  b.onclick = () => { if (state.active === i) togglePlay(); else switchTo(i, true); };
-  $("players").appendChild(b); return b;
-});
-function updateButtons() {
-  btns.forEach((b, i) => {
-    const on = i === state.active;
-    b.classList.toggle("active", on);
-    b.querySelector(".lbl").textContent = (on && playing() ? "❚❚ " : "▶ ") + D.clips[i].name;
-  });
-}
-
-// ---------- spectrogram images ----------
+// ---------- data ----------
 function decodeGray(b64) {
-  return new Promise(resolve => {
+  return new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => {
-      const cv = document.createElement("canvas"); cv.width = img.width; cv.height = img.height;
+      const cv = el("canvas", {width: img.width, height: img.height});
       const cx = cv.getContext("2d"); cx.drawImage(img, 0, 0);
       const px = cx.getImageData(0, 0, img.width, img.height).data;
       const g = new Uint8Array(img.width * img.height);
       for (let i = 0; i < g.length; i++) g[i] = px[i * 4];
       resolve({w: img.width, h: img.height, g});
     };
+    img.onerror = reject;
     img.src = "data:image/png;base64," + b64;
   });
 }
 function colorize(G, lut, map) {
-  const cv = document.createElement("canvas"); cv.width = G.w; cv.height = G.h;
+  const cv = el("canvas", {width: G.w, height: G.h});
   const cx = cv.getContext("2d"), im = cx.createImageData(G.w, G.h), d = im.data;
   const table = new Array(256); for (let v = 0; v < 256; v++) table[v] = lut[map(v)];
   for (let i = 0, j = 0; i < G.g.length; i++, j += 4) { const c = table[G.g[i]]; d[j] = c[0]; d[j + 1] = c[1]; d[j + 2] = c[2]; d[j + 3] = 255; }
   cx.putImageData(im, 0, 0); return cv;
 }
-const gray = D.clips.map(() => ({})), diffGray = {};
-const colored = D.clips.map(() => ({})), diffColored = {};
 function specMap(v) {
   const db = D.floorStored + v / 255 * -D.floorStored;
   return Math.max(0, Math.min(255, Math.round((db - state.floor) / -state.floor * 255)));
 }
-function recolor() {
-  D.clips.forEach((c, i) => { for (const r in gray[i]) colored[i][r] = colorize(gray[i][r], D.lut.magma, specMap); });
-  for (const r in diffGray) diffColored[r] = colorize(diffGray[r], D.lut.diverging, v => v);
-  dirty = true;
+function colorTrack(t) { t.colored = {}; for (const r in t.gray) t.colored[r] = colorize(t.gray[r], D.lut.magma, specMap); }
+function recolor() { tracks.forEach(t => loaded(t) && colorTrack(t)); dirty = true; }
+
+async function fillTrack(t, c, audioSrc) {
+  Object.assign(t, {name: c.name, note: c.note || "", sr: c.sr, duration: c.duration, praat: c.praat,
+                    words: c.words || [], loading: false, error: ""});
+  const gray = {};
+  for (const r of RES) gray[r] = Object.assign(await decodeGray(c.spec[r].png), {hop: c.spec[r].hop});
+  t.gray = gray; colorTrack(t);
+  t.audio = new Audio(audioSrc); t.audio.preload = "auto";
+  t.audio.addEventListener("ended", () => { if (tracks[state.active] === t) { state.cursor = t.duration; updateButtons(); dirty = true; } });
+}
+async function api(path, rel) {
+  const r = await fetch(`${path}?path=${encodeURIComponent(rel)}`);
+  const body = await r.json().catch(() => ({error: `HTTP ${r.status}`}));
+  if (!r.ok || body.error) throw new Error(body.error || `HTTP ${r.status}`);
+  return body;
+}
+async function loadTrack(i, rel) {
+  const old = tracks[i]; if (old && old.audio) old.audio.pause();
+  const t = {path: rel, name: rel ? basename(rel) : "", loading: !!rel, error: "", words: []};
+  tracks[i] = t; changed();
+  if (!rel) return;
+  try { await fillTrack(t, await api("api/clip", rel), `api/audio?path=${encodeURIComponent(rel)}`); }
+  catch (e) { t.loading = false; t.error = e.message; }
+  if (tracks[i] === t) changed();
+}
+async function loadWords(t, btn) {
+  btn.disabled = true; btn.textContent = "transcribing…";
+  try { const w = await api("api/words", t.path); t.words = w.words; t.note = w.note || t.note; state.ovWords = true; $("ovWords").checked = true; }
+  catch (e) { t.error = e.message; }
+  changed();
+}
+async function loadFrames(rel) {
+  framesPath = rel; frames = null;
+  if (rel) { try { frames = await api("api/frames", rel); } catch (e) { alert(`frames: ${e.message}`); framesPath = ""; } }
+  changed();
+}
+
+// The difference pane: track 2 minus track 1 in dB, from the 8-bit spectrograms (any time grids).
+function computeDiff() {
+  diffImg = {};
+  const [a, b] = tracks; if (!loaded(a) || !loaded(b)) return;
+  const unit = -D.floorStored / 255, quiet = (D.quietDb - D.floorStored) / unit;
+  for (const r of RES) {
+    const A = a.gray[r], B = b.gray[r]; if (A.h !== B.h) continue;
+    const hop = Math.min(A.hop, B.hop), W = Math.ceil(duration / hop) + 1, H = A.h, g = new Uint8Array(W * H);
+    for (let x = 0; x < W; x++) {
+      const ca = Math.round(x * hop / A.hop), cb = Math.round(x * hop / B.hop);
+      for (let y = 0; y < H; y++) {
+        const va = ca < A.w ? A.g[y * A.w + ca] : 0, vb = cb < B.w ? B.g[y * B.w + cb] : 0;
+        const d = (va < quiet && vb < quiet) ? 0 : (vb - va) * unit;
+        g[y * W + x] = Math.round(128 + Math.max(-1, Math.min(1, d / D.diffRange)) * 127);
+      }
+    }
+    diffImg[r] = {canvas: colorize({w: W, h: H, g}, D.lut.diverging, v => v), hop};
+  }
+}
+
+// Call after any change to tracks or frames: recomputes extents and rebuilds the panes.
+function changed() {
+  const durs = tracks.filter(loaded).map(t => t.duration);
+  const newDur = Math.max(0.1, ...durs);
+  if (newDur !== duration) { const whole = state.t0 <= 0 && state.t1 >= duration - 1e-6; duration = newDur; if (whole || state.t1 > duration) setView(whole ? 0 : state.t0, whole ? duration : state.t1); }
+  if (state.active >= tracks.length || !loaded(tracks[state.active])) { const k = tracks.findIndex(loaded); state.active = Math.max(0, k); }
+  state.cursor = Math.min(state.cursor, duration);
+  computeDiff(); pitchRange = null; build(); writeHash();
+}
+
+// ---------- audio ----------
+const activeAudio = () => (tracks[state.active] && tracks[state.active].audio) || null;
+const playing = () => { const a = activeAudio(); return !!a && !a.paused; };
+function nowT() { return playing() ? activeAudio().currentTime : state.cursor; }
+function switchTo(i, play) {
+  if (!loaded(tracks[i])) return;
+  const t = nowT(), wasPlaying = playing();
+  if (activeAudio()) activeAudio().pause();
+  state.active = i; state.cursor = Math.min(t, tracks[i].duration);
+  tracks[i].audio.currentTime = state.cursor;
+  if (play ?? wasPlaying) tracks[i].audio.play();
+  updateButtons(); dirty = true;
+}
+function togglePlay() {
+  const a = activeAudio(); if (!a) return;
+  if (a.paused) { if (state.cursor >= tracks[state.active].duration - 0.01) state.cursor = 0; a.currentTime = state.cursor; a.play(); }
+  else { a.pause(); state.cursor = a.currentTime; }
+  updateButtons();
+}
+function seek(t) {
+  const a = activeAudio(); if (!a) return;
+  state.cursor = Math.max(0, Math.min(t, tracks[state.active].duration));
+  a.currentTime = state.cursor; dirty = true;
+}
+let btns = [];
+function buildButtons() {
+  $("players").replaceChildren(); btns = [];
+  tracks.forEach((t, i) => {
+    if (!loaded(t)) { btns.push(null); return; }
+    const b = el("button");
+    b.innerHTML = `<span class="sw" style="background:${CLIP_COLORS[i % 6]}"></span><span class="lbl"></span><span class="k">${i + 1}</span>`;
+    b.onclick = () => { if (state.active === i) togglePlay(); else switchTo(i, true); };
+    $("players").appendChild(b); btns.push(b);
+  });
+  updateButtons();
+}
+function updateButtons() {
+  btns.forEach((b, i) => {
+    if (!b) return;
+    const on = i === state.active;
+    b.classList.toggle("active", on);
+    b.querySelector(".lbl").textContent = (on && playing() ? "❚❚ " : "▶ ") + tracks[i].name;
+  });
 }
 
 // ---------- panes ----------
-const panes = [];
-function makePane(kind, idx, title, legend) {
-  const div = document.createElement("div"); div.className = "pane";
-  const head = document.createElement("div"); head.className = "head";
-  head.innerHTML = `<b></b><span class="note"></span><span class="legend"></span>`;
-  head.querySelector("b").textContent = title;
-  if (kind === "spec" && D.clips[idx].note) head.querySelector(".note").textContent = D.clips[idx].note;
-  if (legend) head.querySelector(".legend").innerHTML = legend;
-  const cv = document.createElement("canvas");
-  div.appendChild(head); div.appendChild(cv); $("panes").appendChild(div);
+let panes = [];
+const sw = (c, t) => `<span><span class="sw" style="background:${c}"></span>${t}</span>`;
+function makePane(kind, idx, head) {
+  const div = el("div", {className: "pane"}), cv = el("canvas");
+  div.append(el("div", {className: "head"}, ...head), cv); $("panes").appendChild(div);
   const p = {kind, idx, div, cv, ctx: cv.getContext("2d")};
   attachInput(p); panes.push(p); return p;
 }
-const sw = (c, t) => `<span><span class="sw" style="background:${c}"></span>${t}</span>`;
-const specLegend = (D.frames ? sw("#35e0ff", "frames formants") : "") + (D.clips.some(c => c.praat) ? sw("#ffffff", "Praat formants") : "");
-D.clips.forEach((c, i) => makePane("spec", i, `${i + 1}. ${c.name}`, specLegend));
-const diffPane = D.diff ? makePane("diff", 0, `difference: ${D.clips[1].name} − ${D.clips[0].name}`,
-  sw("#c0392b", `${D.clips[1].name} louder`) + sw("#2e6db4", `${D.clips[0].name} louder`) + `<span>±${D.diffRange} dB</span>`) : null;
-const hasPraat = D.clips.some(c => c.praat);
-const pitchPane = (hasPraat || D.frames) ? makePane("pitch", 0, "pitch",
-  D.clips.map((c, i) => c.praat ? sw(CLIP_COLORS[i % 6], `Praat f0: ${c.name}`) : "").join("") + (D.frames ? sw("var(--text)", "frames gp") : "")) : null;
-const ampPane = D.frames ? makePane("amp", 0, "source amplitudes (frames)",
-  sw("#ff9f1c", "ga voice") + sw("#2ec4b6", "aa aspiration") + sw("#b388ff", "fa frication")) : null;
-if (!D.frames) { $("lblFrames").classList.add("hidden"); }
-if (!hasPraat) { $("lblPraat").classList.add("hidden"); }
-if (!D.clips.some(c => c.words.length)) { $("lblWords").classList.add("hidden"); state.ovWords = false; }
-if (!D.diff) { $("lblDiff").classList.add("hidden"); }
-if (diffPane) diffPane.div.classList.add("hidden");
-
+function legend(html) { const s = el("span", {className: "legend"}); s.innerHTML = html; return s; }
+function fileSelect(current) {
+  const sel = el("select", {className: "file", title: "choose the audio file for this track"});
+  sel.add(new Option("— choose a file —", ""));
+  const groups = new Map();
+  for (const f of files.audio) { const dir = f.includes("/") ? f.slice(0, f.lastIndexOf("/")) : "."; if (!groups.has(dir)) groups.set(dir, []); groups.get(dir).push(f); }
+  for (const [dir, fs] of groups) {
+    const og = el("optgroup", {label: dir === "." ? "(top folder)" : dir + "/"});
+    for (const f of fs) og.appendChild(new Option(f.split("/").pop(), f));
+    sel.appendChild(og);
+  }
+  if (current && !files.audio.includes(current)) sel.add(new Option(current + " (missing)", current));
+  sel.value = current || "";
+  return sel;
+}
+function trackHead(i) {
+  const t = tracks[i], kids = [];
+  const num = el("b", {textContent: SERVE ? `${i + 1}.` : `${i + 1}. ${t.name}`});
+  num.style.color = CLIP_COLORS[i % 6]; kids.push(num);
+  if (SERVE) {
+    const sel = fileSelect(t.path); sel.onchange = () => loadTrack(i, sel.value); kids.push(sel);
+  }
+  const note = el("span", {className: "note" + (t.error ? " err" : "")});
+  note.textContent = t.error || (t.loading ? "loading…" : [t.note, loaded(t) ? `${t.duration.toFixed(2)} s · ${t.sr / 1000} kHz` : ""].filter(Boolean).join(" · "));
+  kids.push(note);
+  if (SERVE && loaded(t) && !t.words.length) {
+    const wb = el("button", {className: "icon", textContent: "words", title: "Whisper word timings (and WER if a .txt transcript is next to the file)"});
+    wb.onclick = () => loadWords(t, wb); kids.push(wb);
+  }
+  if (SERVE && tracks.length > 1) {
+    const x = el("button", {className: "icon", textContent: "✕", title: "remove this track"});
+    x.onclick = () => { if (t.audio) t.audio.pause(); tracks.splice(i, 1); changed(); }; kids.push(x);
+  }
+  kids.push(legend((frames ? sw("#35e0ff", "frames formants") : "") + (tracks.some(t => t.praat) ? sw("#ffffff", "Praat formants") : "")));
+  return kids;
+}
+let diffPane = null;
+function build() {
+  $("panes").replaceChildren(); panes = [];
+  tracks.forEach((t, i) => makePane("spec", i, trackHead(i)));
+  const [a, b] = tracks;
+  diffPane = loaded(a) && loaded(b) ? makePane("diff", 0, [el("b", {textContent: `difference: ${b.name} − ${a.name}`}),
+    legend(sw("#c0392b", `${b.name} louder`) + sw("#2e6db4", `${a.name} louder`) + `<span>±${D.diffRange} dB</span>`)]) : null;
+  const hasPraat = tracks.some(t => loaded(t) && t.praat);
+  if (hasPraat || frames) makePane("pitch", 0, [el("b", {textContent: "pitch"}),
+    legend(tracks.map((t, i) => loaded(t) && t.praat ? sw(CLIP_COLORS[i % 6], `Praat f0: ${t.name}`) : "").join("") + (frames ? sw("var(--text)", "frames gp") : ""))]);
+  if (frames) makePane("amp", 0, [el("b", {textContent: "source amplitudes (frames)"}),
+    legend(sw("#ff9f1c", "ga voice") + sw("#2ec4b6", "aa aspiration") + sw("#b388ff", "fa frication"))]);
+  $("lblFrames").classList.toggle("hidden", !frames);
+  $("lblPraat").classList.toggle("hidden", !hasPraat);
+  $("lblWords").classList.toggle("hidden", !tracks.some(t => t.words && t.words.length));
+  $("lblDiff").classList.toggle("hidden", !diffPane);
+  if (diffPane) diffPane.div.classList.toggle("hidden", !state.ovDiff);
+  buildButtons(); resize();
+}
 function paneHeight(p) {
-  if (p.kind === "spec") return SPEC_H + (state.ovWords && D.clips[p.idx].words.length ? WORDS_H : 0) + AXIS_H;
+  if (p.kind === "spec") return SPEC_H + (state.ovWords && tracks[p.idx].words.length ? WORDS_H : 0) + AXIS_H;
   if (p.kind === "diff") return SPEC_H + AXIS_H;
   return LANE_H + AXIS_H;
 }
@@ -491,12 +817,14 @@ function drawTimeAxis(p, y) {
     c.fillText(t.toFixed(step < 0.1 ? 2 : step < 1 ? 1 : 0) + " s", x, y + 14);
   }
 }
-function drawImageView(p, img, top, H) {
-  const g = D.grid[state.res], c = p.ctx;
-  const rows = img.height, shown = Math.max(2, Math.round(rows * state.fmax / D.fmax));
-  const sx = state.t0 / g.hop, sw = (state.t1 - state.t0) / g.hop;
+// Image column k is centred at k * hop; only the part of the view the image covers is drawn.
+function drawImageView(p, img, hop, top, H) {
+  const c = p.ctx, rows = img.height, shown = Math.max(2, Math.round(rows * state.fmax / D.fmax));
+  const s0 = state.t0 / hop, s1 = state.t1 / hop, c0 = Math.max(0, s0), c1 = Math.min(img.width, s1), W = p.w - L - R;
+  if (c1 <= c0) return;
+  const x0 = L + (c0 - s0) / (s1 - s0) * W, x1 = L + (c1 - s0) / (s1 - s0) * W;
   c.imageSmoothingEnabled = true;
-  c.drawImage(img, sx, rows - shown, sw, shown, L, top, p.w - L - R, H);
+  c.drawImage(img, c0, rows - shown, c1 - c0, shown, x0, top, x1 - x0, H);
 }
 function drawFreqAxis(p, top, H) {
   const c = p.ctx, step = niceStep(state.fmax, 5);
@@ -517,32 +845,38 @@ function dots(p, ts, vs, on, top, H, color, r, scaleY) {
   }
 }
 function line(p, ts, vs, top, H, color, scaleY, width) {
-  const c = p.ctx; c.strokeStyle = color; c.lineWidth = width || 1.4; c.beginPath(); let pen = false;
+  const c = p.ctx; c.save(); c.beginPath(); c.rect(L, top, p.w - L - R, H); c.clip();
+  c.strokeStyle = color; c.lineWidth = width || 1.4; c.beginPath(); let pen = false;
   for (let k = 0; k < ts.length; k++) {
     const v = vs[k];
     if (v === null) { pen = false; continue; }
     const x = tx(p, ts[k]), y = scaleY(v);
     if (pen) c.lineTo(x, y); else c.moveTo(x, y); pen = true;
   }
-  c.stroke(); c.lineWidth = 1;
+  c.stroke(); c.restore();
 }
 function drawPlayhead(p, top, H) {
-  const t = nowT(); if (t < state.t0 || t > state.t1) return;
+  const t = nowT(); if (!activeAudio() || t < state.t0 || t > state.t1) return;
   const c = p.ctx, x = tx(p, t);
   c.strokeStyle = "rgba(255,255,255,.9)"; c.lineWidth = 1.5; c.beginPath(); c.moveTo(x, top); c.lineTo(x, top + H); c.stroke();
   c.strokeStyle = "rgba(0,0,0,.5)"; c.lineWidth = 1; c.beginPath(); c.moveTo(x + 1.5, top); c.lineTo(x + 1.5, top + H); c.stroke();
 }
+function drawPlaceholder(p, text) {
+  const c = p.ctx; c.fillStyle = css("--empty"); c.fillRect(L, 0, p.w - L - R, SPEC_H);
+  c.fillStyle = css("--muted"); c.font = "13px system-ui"; c.textAlign = "center"; c.textBaseline = "middle";
+  c.fillText(text, L + (p.w - L - R) / 2, SPEC_H / 2); c.textBaseline = "alphabetic";
+}
 function drawSpec(p) {
-  const c = p.ctx, clip = D.clips[p.idx], top = 0, H = SPEC_H;
+  const c = p.ctx, t = tracks[p.idx], top = 0, H = SPEC_H;
   c.clearRect(0, 0, p.w, p.h);
-  const img = colored[p.idx][state.res]; if (!img) return;
-  drawImageView(p, img, top, H); drawFreqAxis(p, top, H);
+  if (!loaded(t)) { drawPlaceholder(p, t.loading ? "computing spectrogram…" : t.error ? "could not load this file" : "choose a file above"); drawTimeAxis(p, H); return; }
+  drawImageView(p, t.colored[state.res], t.gray[state.res].hop, top, H); drawFreqAxis(p, top, H);
   const fy = f => top + H * (1 - f / state.fmax);
-  if (state.ovPraat && clip.praat) for (const F of clip.praat.F) dots(p, clip.praat.t, F, null, top, H, "rgba(255,255,255,.75)", 1.2, fy);
-  if (state.ovFrames && D.frames) for (const F of D.frames.F) dots(p, D.frames.t, F, D.frames.on, top, H, "rgba(53,224,255,.85)", 1.4, fy);
+  if (state.ovPraat && t.praat) for (const F of t.praat.F) dots(p, t.praat.t, F, null, top, H, "rgba(255,255,255,.75)", 1.2, fy);
+  if (state.ovFrames && frames) for (const F of frames.F) dots(p, frames.t, F, frames.on, top, H, "rgba(53,224,255,.85)", 1.4, fy);
   if (p.idx === state.active) { c.strokeStyle = CLIP_COLORS[p.idx % 6]; c.lineWidth = 3; c.beginPath(); c.moveTo(L - 2, top); c.lineTo(L - 2, top + H); c.stroke(); c.lineWidth = 1; }
   let y = top + H;
-  if (state.ovWords && clip.words.length) { drawWords(p, clip.words, y, WORDS_H); y += WORDS_H; }
+  if (state.ovWords && t.words.length) { drawWords(p, t.words, y, WORDS_H); y += WORDS_H; }
   drawPlayhead(p, top, y - top); drawTimeAxis(p, y);
 }
 function drawWords(p, words, top, H) {
@@ -559,17 +893,16 @@ function drawWords(p, words, top, H) {
 }
 function drawDiff(p) {
   const c = p.ctx; c.clearRect(0, 0, p.w, p.h);
-  const img = diffColored[state.res]; if (!img) return;
-  drawImageView(p, img, 0, SPEC_H); drawFreqAxis(p, 0, SPEC_H);
+  const d = diffImg[state.res]; if (!d) return;
+  drawImageView(p, d.canvas, d.hop, 0, SPEC_H); drawFreqAxis(p, 0, SPEC_H);
   drawPlayhead(p, 0, SPEC_H); drawTimeAxis(p, SPEC_H);
 }
-let pitchRange = null;
 function drawPitch(p) {
   const c = p.ctx, top = 4, H = LANE_H - 8; c.clearRect(0, 0, p.w, p.h);
   if (!pitchRange) {
     const all = [];
-    D.clips.forEach(cl => cl.praat && cl.praat.f0.forEach(v => v && all.push(v)));
-    if (D.frames) D.frames.gp.forEach(v => v && all.push(v));
+    tracks.forEach(t => loaded(t) && t.praat && t.praat.f0.forEach(v => v && all.push(v)));
+    if (frames) frames.gp.forEach(v => v && all.push(v));
     all.sort((a, b) => a - b);
     const lo = all.length ? all[Math.floor(all.length * .02)] : 80, hi = all.length ? all[Math.floor(all.length * .98)] : 300;
     pitchRange = [Math.max(40, lo / 1.25), Math.min(1000, hi * 1.25)];
@@ -579,8 +912,8 @@ function drawPitch(p) {
   c.fillStyle = css("--axis"); c.font = "11px system-ui"; c.textAlign = "right"; c.textBaseline = "middle";
   for (const f of [50, 75, 100, 150, 200, 300, 400, 600, 800]) if (f >= lo && f <= hi) { c.fillText(f, L - 6, py(f)); }
   c.textBaseline = "alphabetic";
-  D.clips.forEach((cl, i) => { if (cl.praat) dots(p, cl.praat.t, cl.praat.f0, null, top, H, CLIP_COLORS[i % 6], 1.6, py); });
-  if (D.frames) line(p, D.frames.t, D.frames.gp, top, H, css("--text"), py, 1.2);
+  tracks.forEach((t, i) => { if (loaded(t) && t.praat) dots(p, t.praat.t, t.praat.f0, null, top, H, CLIP_COLORS[i % 6], 1.6, py); });
+  if (frames) line(p, frames.t, frames.gp, top, H, css("--text"), py, 1.2);
   drawPlayhead(p, top, H); drawTimeAxis(p, LANE_H);
 }
 function drawAmp(p) {
@@ -590,9 +923,9 @@ function drawAmp(p) {
   c.fillStyle = css("--axis"); c.font = "11px system-ui"; c.textAlign = "right"; c.textBaseline = "middle";
   for (const v of [0, 128, 255]) c.fillText(v, L - 6, ay(v));
   c.textBaseline = "alphabetic";
-  line(p, D.frames.t, D.frames.ga, top, H, "#ff9f1c", ay);
-  line(p, D.frames.t, D.frames.aa, top, H, "#2ec4b6", ay);
-  line(p, D.frames.t, D.frames.fa, top, H, "#b388ff", ay);
+  line(p, frames.t, frames.ga, top, H, "#ff9f1c", ay);
+  line(p, frames.t, frames.aa, top, H, "#2ec4b6", ay);
+  line(p, frames.t, frames.fa, top, H, "#b388ff", ay);
   drawPlayhead(p, top, H); drawTimeAxis(p, LANE_H);
 }
 function drawAll() {
@@ -602,11 +935,10 @@ function drawAll() {
     else if (p.kind === "pitch") drawPitch(p); else drawAmp(p);
   }
 }
-let dirty = true;
 function loop() {
   if (playing()) {
-    const t = audios[state.active].currentTime, span = state.t1 - state.t0;
-    if (t > state.t1 || t < state.t0) { state.t0 = Math.max(0, Math.min(t - span * 0.1, D.duration - span)); state.t1 = state.t0 + span; }
+    const t = activeAudio().currentTime, span = state.t1 - state.t0;
+    if (t > state.t1 || t < state.t0) { state.t0 = Math.max(0, Math.min(t - span * 0.1, duration - span)); state.t1 = state.t0 + span; }
     dirty = true;
   }
   if (dirty) { dirty = false; drawAll(); }
@@ -615,8 +947,8 @@ function loop() {
 
 // ---------- interaction ----------
 function setView(t0, t1) {
-  const span = Math.max(0.05, Math.min(D.duration, t1 - t0));
-  t0 = Math.max(0, Math.min(t0, D.duration - span));
+  const span = Math.max(0.05, Math.min(duration, t1 - t0));
+  t0 = Math.max(0, Math.min(t0, duration - span));
   state.t0 = t0; state.t1 = t0 + span; dirty = true;
 }
 function attachInput(p) {
@@ -640,12 +972,12 @@ function attachInput(p) {
     const tm = xt(p, e.offsetX), k = Math.exp(e.deltaY * 0.0015);
     setView(tm - (tm - state.t0) * k, tm + (state.t1 - tm) * k);
   }, {passive: false});
-  p.cv.addEventListener("dblclick", () => setView(0, D.duration));
+  p.cv.addEventListener("dblclick", () => setView(0, duration));
 }
 window.addEventListener("keydown", e => {
   if (e.target.tagName === "SELECT" || e.target.tagName === "INPUT") return;
   if (e.code === "Space") { e.preventDefault(); togglePlay(); }
-  else if (/^Digit[1-9]$/.test(e.code)) { const i = +e.code.slice(5) - 1; if (i < D.clips.length) switchTo(i); }
+  else if (/^Digit[1-9]$/.test(e.code)) { const i = +e.code.slice(5) - 1; if (i < tracks.length) switchTo(i); }
   else if (e.code === "ArrowRight") seek(nowT() + 0.5);
   else if (e.code === "ArrowLeft") seek(nowT() - 0.5);
   else if (e.key === "+" || e.key === "=") { const m = (state.t0 + state.t1) / 2, h = (state.t1 - state.t0) / 2.5; setView(m - h, m + h); }
@@ -657,27 +989,63 @@ for (const f of [2000, 3000, 4000, 5000, 6000, 8000, 10000, 12000]) if (f < D.fm
 $("fmax").add(new Option((D.fmax / 1000).toFixed(1).replace(".0", "") + " kHz", D.fmax)); $("fmax").value = D.fmax;
 $("fmax").onchange = e => { state.fmax = +e.target.value; dirty = true; };
 for (const id of ["ovFrames", "ovPraat", "ovWords"]) $(id).onchange = e => { state[id] = e.target.checked; resize(); };
-$("ovDiff").onchange = e => { state.ovDiff = e.target.checked; diffPane.div.classList.toggle("hidden", !state.ovDiff); resize(); };
+$("ovDiff").onchange = e => { state.ovDiff = e.target.checked; if (diffPane) diffPane.div.classList.toggle("hidden", !state.ovDiff); resize(); };
 window.addEventListener("resize", resize);
 
-// ---------- URL options (#t0=..&t1=..&res=narrow&floor=-60&fmax=5000&diff=1&praat=1&frames=0&words=0) ----------
-function applyHash() {
-  const h = new URLSearchParams(location.hash.slice(1));
-  if (h.has("res") && D.grid[h.get("res")]) { state.res = h.get("res"); $("res").value = state.res; }
+// ---------- folder browser controls ----------
+function fillFramesSelect() {
+  const sel = $("framesFile"); sel.replaceChildren(new Option("none", ""));
+  for (const f of files.frames) sel.add(new Option(f, f));
+  if (framesPath && !files.frames.includes(framesPath)) sel.add(new Option(framesPath + " (missing)", framesPath));
+  sel.value = framesPath;
+}
+if (SERVE) {
+  $("addTrack").onclick = () => { tracks.push({path: "", name: "", words: []}); changed(); };
+  $("framesFile").onchange = e => loadFrames(e.target.value);
+  $("rescan").onclick = async () => {
+    try { const r = await fetch("api/files"); files = await r.json(); } catch (e) { alert(`rescan: ${e.message}`); return; }
+    fillFramesSelect(); build();
+  };
+} else {
+  $("serveControls").classList.add("hidden"); $("serveHelp").classList.add("hidden");
+}
+
+// ---------- URL options (#t0=..&t1=..&res=narrow&floor=-60&fmax=5000&diff=1&praat=1&frames=0&words=0
+//            folder browser: &files=a.wav,b.wav&framesfile=x_frames.csv) ----------
+const hashIn = new URLSearchParams(location.hash.slice(1));
+function applyHash(h) {
+  if (h.has("res") && RES.includes(h.get("res"))) { state.res = h.get("res"); $("res").value = state.res; }
   if (h.has("floor")) { state.floor = Math.max(-100, Math.min(-10, +h.get("floor"))); $("floor").value = state.floor; $("floorv").textContent = state.floor + " dB"; }
   if (h.has("fmax")) { state.fmax = Math.min(D.fmax, +h.get("fmax")); if (![...$("fmax").options].some(o => +o.value === state.fmax)) $("fmax").add(new Option(state.fmax + " Hz", state.fmax)); $("fmax").value = state.fmax; }
   for (const [key, id] of [["frames", "ovFrames"], ["praat", "ovPraat"], ["words", "ovWords"], ["diff", "ovDiff"]])
     if (h.has(key)) { state[id] = h.get(key) === "1"; $(id).checked = state[id]; }
-  if (diffPane) diffPane.div.classList.toggle("hidden", !state.ovDiff);
-  if (h.has("t0") || h.has("t1")) setView(+(h.get("t0") ?? 0), +(h.get("t1") ?? D.duration));
+}
+function writeHash() {
+  if (!SERVE) return;
+  const h = new URLSearchParams(location.hash.slice(1));
+  h.set("files", tracks.map(t => t.path).join(","));
+  if (framesPath) h.set("framesfile", framesPath); else h.delete("framesfile");
+  for (const k of ["t0", "t1"]) h.delete(k);      // the view is only applied once, at load
+  history.replaceState(null, "", "#" + h.toString().replace(/%2F/g, "/").replace(/%2C/g, ","));
 }
 
 // ---------- start ----------
 (async () => {
-  applyHash(); updateButtons(); resize();
-  for (let i = 0; i < D.clips.length; i++) for (const r in D.clips[i].spec) gray[i][r] = await decodeGray(D.clips[i].spec[r]);
-  if (D.diff) for (const r in D.diff) diffGray[r] = await decodeGray(D.diff[r]);
-  recolor(); requestAnimationFrame(loop);
+  applyHash(hashIn);
+  if (SERVE) {
+    const initial = hashIn.has("files") ? hashIn.get("files").split(",") : D.serve.initial;
+    framesPath = hashIn.has("framesfile") ? hashIn.get("framesfile") : D.serve.framesFile;
+    fillFramesSelect();
+    tracks = (initial.length ? initial : ["", ""]).map(p => ({path: p, name: "", words: []}));
+    changed(); requestAnimationFrame(loop);
+    await Promise.all([...tracks.map((t, i) => t.path ? loadTrack(i, t.path) : null), framesPath ? loadFrames(framesPath) : null]);
+  } else {
+    tracks = D.clips.map(() => ({path: "", words: []}));
+    for (let i = 0; i < D.clips.length; i++) await fillTrack(tracks[i], D.clips[i], "data:audio/wav;base64," + D.clips[i].audio);
+    changed(); requestAnimationFrame(loop);
+  }
+  if (hashIn.has("t0") || hashIn.has("t1")) setView(+(hashIn.get("t0") ?? 0), +(hashIn.get("t1") ?? duration));
+  else setView(0, duration);
   document.body.dataset.ready = "1";
 })();
 </script>

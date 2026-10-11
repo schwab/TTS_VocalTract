@@ -154,6 +154,19 @@ python -m vocaltract.analysis.compare a.wav b.wav --frames out/resynth/x_frames.
 
 Views are shareable through the URL, e.g. `x_compare.html#t0=1.6&t1=3.6&res=narrow&diff=1`.
 
+**Folder browser.** To pick files from the page instead of the command line, serve a folder:
+
+```bash
+python -m vocaltract.analysis.compare --serve .        # or --serve out/, assets/phase1/, ...
+```
+
+This starts a local server (http://127.0.0.1:8765/, localhost only) and opens the page. Each track has a
+menu of every audio file under the folder (wav/flac/ogg/mp3, grouped by directory). There are buttons to
+add or remove tracks, a **Frames file** menu for `*_frames.csv` overlays, and a per-track **words** button
+(Whisper timings, plus WER when a `<stem>.txt` transcript sits next to the file). Spectrograms are computed
+when you pick a file and are cached. The selection is kept in the URL (`#files=a.wav,b.wav&framesfile=...`),
+so reloading or bookmarking restores it. **↻ rescan** picks up files written since the page loaded.
+
 ## Roadmap
 
 - [ ] **Phase 1** — Minimal differentiable LPC pipeline (random audio → params → LPC → reconstruction)

@@ -197,11 +197,50 @@ def test_compare_page_contents(vowel_resynth):
     blob = re.search(r'<script type="application/json" id="data">(.*?)</script>', html, re.S)[1]
     data = json.loads(blob)
     assert [c["name"] for c in data["clips"]] == ["orig", "synth"]
-    assert data["fmax"] == 8000 and set(data["diff"]) == {"wide", "narrow"}
+    assert data["fmax"] == 8000 and data["serve"] is None
+    spec = data["clips"][1]["spec"]
+    assert set(spec) == {"wide", "narrow"} and spec["wide"]["rows"] == 256
+    assert spec["wide"]["cols"] == pytest.approx(len(res.audio) / 20000 / 0.002, abs=2)
     assert len(data["frames"]["t"]) == len(res.frames)
     assert data["clips"][0]["words"][0]["word"] == "ah"
     single = build_page(clips[:1], praat=False)
-    assert '"diff":null' in single and '"frames":null' in single
+    assert '"frames":null' in single
+
+
+def test_compare_server(tmp_path):
+    import json, threading, urllib.error, urllib.request
+    from http.server import ThreadingHTTPServer
+    import soundfile as sf
+    from vocaltract.analysis.compare import CompareServer, list_files
+    from vocaltract.params import PARAM_NAMES
+    (tmp_path / "sub").mkdir()
+    (tmp_path / ".hidden").mkdir()
+    tone = 0.3 * np.sin(2 * np.pi * 220 * np.arange(8000) / SR)
+    sf.write(tmp_path / "a.wav", tone, SR)
+    sf.write(tmp_path / "sub" / "b.flac", tone, SR)
+    sf.write(tmp_path / ".hidden" / "c.wav", tone, SR)
+    (tmp_path / "sub" / "x_frames.csv").write_text("time_s," + ",".join(PARAM_NAMES) + "\n"
+                                                   + "0.01," + ",".join(["100"] * 13) + "\n")
+    assert list_files(tmp_path) == {"audio": ["a.wav", "sub/b.flac"], "frames": ["sub/x_frames.csv"]}
+
+    app = CompareServer(tmp_path, praat=False)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), app.make_handler(["a.wav"], ""))
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    get = lambda path: urllib.request.urlopen(base + path, timeout=30).read()
+    try:
+        page = get("/").decode()
+        assert '"initial":["a.wav"]' in page and "sub/b.flac" in page
+        clip = json.loads(get("/api/clip?path=sub/b.flac"))
+        assert clip["name"] == "b" and clip["audio"] is None and clip["duration"] == 0.5
+        assert get("/api/audio?path=a.wav")[:4] == b"RIFF"
+        assert json.loads(get("/api/frames?path=sub/x_frames.csv"))["ga"] == [100]
+        for bad in ("../a.wav", "/etc/passwd", "missing.wav"):
+            with pytest.raises(urllib.error.HTTPError) as err:
+                get("/api/clip?path=" + bad)
+            assert err.value.code == 404
+    finally:
+        httpd.shutdown()
 
 
 def test_sv_layer_export(tmp_path, vowel_resynth):
