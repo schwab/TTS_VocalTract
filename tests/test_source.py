@@ -194,3 +194,64 @@ class TestGradients:
             return make_excitation(p, hop=8, generator=gen)
 
         assert torch.autograd.gradcheck(fn, (params,))
+
+
+class TestVocalTractWaveform:
+    """VocalTract's glottal pulse g(phi) = -cos(2 pi 2**(16 (phi - 1)))."""
+
+    def phases(self, f0: float = 100.0, n: int = 16000) -> np.ndarray:
+        return (np.arange(n) * f0 / SR) % 1.0
+
+    def test_band_limited_matches_closed_form_without_dc(self):
+        from vocaltract.source import vocaltract_pulse
+
+        freq = torch.full((1, SR), 100.0, dtype=torch.float64)
+        ours = harmonics_from_frequency(freq, SR, waveform="vocaltract")[0].numpy()
+        ref = vocaltract_pulse(self.phases())
+        ref -= ref.mean()
+        # Harmonics above Nyquist are dropped/tapered, so allow a small residual.
+        assert np.abs(ours - ref).max() < 5e-3
+
+    def test_aliased_is_the_closed_form(self):
+        from vocaltract.source import vocaltract_pulse
+
+        freq = torch.full((1, SR), 100.0, dtype=torch.float64)
+        ours = harmonics_from_frequency(freq, SR, waveform="vocaltract_aliased")[0].numpy()
+        np.testing.assert_allclose(ours, vocaltract_pulse(self.phases()), atol=1e-9)
+
+    def test_pulse_shape(self):
+        """Flat at -1 for most of the period, one pulse reaching +1 near the end."""
+        from vocaltract.source import vocaltract_pulse
+
+        phase = np.linspace(0, 1, 10001)[:-1]
+        g = vocaltract_pulse(phase)
+        assert np.all(np.abs(g[phase < 0.5] + 1) < 1e-3)
+        assert phase[np.argmax(g)] == pytest.approx(1 - 1 / 16, abs=1e-3)
+
+    def test_coefficients_reconstruct_pulse(self):
+        from vocaltract.source import harmonic_coefficients, vocaltract_pulse
+
+        cos_k, sin_k = (c.double().numpy() for c in harmonic_coefficients("vocaltract", 2000))
+        phase = np.linspace(0, 1, 512, endpoint=False)
+        k = np.arange(1, 2001)[:, None]
+        series = cos_k @ np.cos(2 * np.pi * k * phase) + sin_k @ np.sin(2 * np.pi * k * phase)
+        ref = vocaltract_pulse(phase)
+        np.testing.assert_allclose(series, ref - ref.mean(), atol=1e-6)
+
+    def test_sawtooth_coefficients(self):
+        from vocaltract.source import SAWTOOTH_NORM, harmonic_coefficients
+
+        cos_k, sin_k = harmonic_coefficients("sawtooth", 5)
+        assert torch.all(cos_k == 0)
+        assert torch.allclose(sin_k, SAWTOOTH_NORM / torch.arange(1.0, 6.0))
+
+    @pytest.mark.parametrize("waveform", ["vocaltract", "vocaltract_aliased"])
+    def test_excitation_gradients(self, waveform):
+        params = constant_params(5, gp=0.4, ga=0.5, aa=0.0).requires_grad_()
+        make_excitation(params, hop=64, waveform=waveform).pow(2).sum().backward()
+        assert params.grad[..., PARAM_NAMES.index("gp")].abs().sum() > 0
+        assert params.grad[..., PARAM_NAMES.index("ga")].abs().sum() > 0
+
+    def test_unknown_waveform(self):
+        with pytest.raises(ValueError):
+            harmonics_from_frequency(torch.full((1, 10), 100.0), SR, waveform="square")

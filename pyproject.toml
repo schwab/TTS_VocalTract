@@ -22,3 +22,8 @@ analysis = ["numba", "praat-parselmouth", "matplotlib", "openai-whisper", "jiwer
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: full 500-step overfit runs (~1 min each); deselect with -m \"not slow\"",
+]

@@ -1,7 +1,15 @@
 """
 Parameter-to-LPC coefficient mapper.
 
-This module implements a differentiable neural network that converts VocalTract
+Two interchangeable mappers convert VocalTract parameter frames (13 parameters)
+into LPC coefficients:
+
+- :class:`FormantToLPC` (default): cascades one resonator per formant parameter
+  f1-f4, as VocalTract does. Formants follow the parameters by construction.
+- :class:`ParamToLPC`: the original MLP mapper (all 13 parameters -> reflection
+  coefficients). Kept for comparison; its parameters are not identifiable.
+
+ParamToLPC details: a differentiable neural network that converts VocalTract
 parameter frames (13 parameters) into LPC (Linear Prediction Coding) coefficients,
 ensuring filter stability through reflection coefficients.
 
@@ -12,11 +20,13 @@ The pipeline:
 All operations are differentiable for end-to-end training.
 """
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from .params import BYTE_SCALE, FORMANT_SCALE, PARAM_NAMES
 
 # Default bandwidth-expansion factor. Every pole radius is multiplied by GAMMA,
 # so no pole can get closer to the unit circle than 1 - GAMMA. At 16 kHz,
@@ -225,6 +235,204 @@ class ParamToLPC(nn.Module):
             a[..., : p - 1] = (front + k_p.unsqueeze(-1) * front_reversed) / denom.unsqueeze(-1)
 
         return k
+
+
+# --- Formant resonator mapper -------------------------------------------------
+
+FORMANT_NAMES = ("f1", "f2", "f3", "f4")
+
+# VocalTract damps every formant resonator by the same factor: pole radius
+# ~0.984 at its 20 kHz sample rate, i.e. -ln(0.984) * 20000 / pi ~= 100 Hz.
+VOCALTRACT_BANDWIDTH_HZ = 100.0
+
+# Learned bandwidths never go below this. At 16 kHz, 40 Hz is a pole radius of
+# exp(-pi * 40 / 16000) ~= 0.992, the same safety margin as ParamToLPC's gamma.
+MIN_BANDWIDTH_HZ = 40.0
+
+# Real "tilt" poles are capped at +/-MAX_TILT_POLE (a single real pole at 0.9
+# is a ~20 dB low-frequency boost: plenty to shape the source's spectral slope).
+MAX_TILT_POLE = 0.9
+
+
+def _as_frames(params: torch.Tensor) -> torch.Tensor:
+    """Promote (13,) or (T, 13) parameter input to (B, T, 13)."""
+    if params.ndim == 1:
+        return params.unsqueeze(0).unsqueeze(0)
+    if params.ndim == 2:
+        return params.unsqueeze(0)
+    if params.ndim != 3:
+        raise ValueError(f"Expected 1D, 2D, or 3D input, got {params.ndim}D")
+    return params
+
+
+def _poly_mul(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+    """Batched polynomial product along the last dim: (..., m), (..., n) -> (..., m + n - 1)."""
+    n = q.shape[-1]
+    return sum(F.pad(p * q[..., j : j + 1], (j, n - 1 - j)) for j in range(n))
+
+
+class FormantToLPC(nn.Module):
+    """
+    Convert parameter frames to LPC coefficients by cascading formant resonators.
+
+    This is the VocalTract model itself: the formant parameters ``f1``-``f4``
+    each place one resonance (a conjugate pole pair) at that frequency, so a
+    parameter frame determines the filter and moving ``f2`` moves exactly the
+    second formant. Unlike :class:`ParamToLPC`, there is no network between
+    the parameters and the filter to "average away" formant motion, and the
+    other 9 parameters cannot influence the filter at all.
+
+    VocalTract's resonator structure (``complex_resonators=True``, default)
+    ----------------------------------------------------------------------
+    VocalTract does not cascade real two-pole sections. Each formant is a
+    *complex* one-pole resonator, ``s[n] = r e^{j theta} (s[n-1] + u[n])``,
+    the four are cascaded on a complex signal, and the output is the real
+    part (see ``reference/engine.py``). With ``Q(z) = prod_i (1 - r_i
+    e^{j theta_i} z^-1)`` that is exactly the pole-zero filter
+
+        H(z) = N(z) / D(z),   D(z) = Q(z) conj(Q)(z),
+        N(z) = Re[ e^{j sum theta_i} * conj(Q)(z) ]   (order 4),
+
+    i.e. the same poles as the all-pole cascade plus a numerator that
+    changes the spectral slope between and above the formants. Without it,
+    optimizing against VocalTract audio moved F2 of /a/ by ~150 Hz to
+    compensate. :meth:`forward` returns the all-pole part D (as LPC
+    coefficients) and :meth:`numerator` returns N; the pipeline applies N as
+    a per-frame FIR before the all-pole filter. ``complex_resonators=False``
+    gives the plain all-pole cascade (``numerator`` returns None).
+
+    Each resonator is the second-order section
+
+        1 - 2 r cos(theta) z^-1 + r^2 z^-2,   theta = 2 pi f / sample_rate,
+        r = exp(-pi * bandwidth / sample_rate)
+
+    and the full polynomial is the product of the four sections and
+    ``tilt_poles`` real first-order sections ``1 - p z^-1``, giving order
+    ``8 + tilt_poles`` (10 by default, same as ParamToLPC).
+
+    Learned (the only trainable parameters):
+        - one bandwidth per formant, initialized to VocalTract's ~100 Hz and
+          kept above MIN_BANDWIDTH_HZ (stored as log(bandwidth - minimum), so
+          Adam's step changes it by a roughly constant ratio);
+        - the real tilt poles, ``MAX_TILT_POLE * tanh(raw)``, initialized to 0
+          (no tilt). They let the filter match the target's overall spectral
+          slope, which differs between VocalTract's glottal pulse and the
+          Phase 1 sawtooth source.
+
+    Stability holds for any parameter values: every pole radius is at most
+    max(exp(-pi * MIN_BANDWIDTH_HZ / sample_rate), MAX_TILT_POLE) < 1. The
+    product is computed in float64 (see :class:`ParamToLPC` on precision).
+    Rounding still moves poles when several formants crowd together, because
+    the direct-form polynomial is ill-conditioned for clustered roots. The
+    worst case, all four formants at 0 Hz, moves the largest radius from 0.98
+    to 0.997, which is still stable. The bundled targets never put F1 below
+    150 Hz.
+
+    Args:
+        sample_rate: Audio sample rate in Hz.
+        bandwidths_hz: Initial bandwidth per formant, each > MIN_BANDWIDTH_HZ.
+        tilt_poles: Number of real tilt poles (0 disables).
+        complex_resonators: Model VocalTract's complex resonators (adds the
+            numerator above). False gives a plain all-pole cascade.
+    """
+
+    input_names = FORMANT_NAMES
+
+    def __init__(
+        self,
+        sample_rate: int = 16000,
+        bandwidths_hz: Tuple[float, ...] = (VOCALTRACT_BANDWIDTH_HZ,) * len(FORMANT_NAMES),
+        tilt_poles: int = 2,
+        complex_resonators: bool = True,
+    ):
+        super().__init__()
+        if len(bandwidths_hz) != len(FORMANT_NAMES):
+            raise ValueError(f"need {len(FORMANT_NAMES)} bandwidths, got {len(bandwidths_hz)}")
+        if min(bandwidths_hz) <= MIN_BANDWIDTH_HZ:
+            raise ValueError(f"bandwidths must exceed {MIN_BANDWIDTH_HZ} Hz, got {bandwidths_hz}")
+        if tilt_poles < 0:
+            raise ValueError(f"tilt_poles must be >= 0, got {tilt_poles}")
+        self.sample_rate = sample_rate
+        self.complex_resonators = complex_resonators
+        self.order = 2 * len(FORMANT_NAMES) + tilt_poles
+        excess = torch.tensor(bandwidths_hz, dtype=torch.float64) - MIN_BANDWIDTH_HZ
+        self.log_bandwidth_excess = nn.Parameter(excess.log())
+        self.raw_tilt = nn.Parameter(torch.zeros(tilt_poles, dtype=torch.float64))
+        self.register_buffer(
+            "formant_index", torch.tensor([PARAM_NAMES.index(n) for n in FORMANT_NAMES]),
+            persistent=False,
+        )
+
+    def bandwidths_hz(self) -> torch.Tensor:
+        """Current formant bandwidths in Hz, shape (4,)."""
+        return MIN_BANDWIDTH_HZ + self.log_bandwidth_excess.exp()
+
+    def tilt(self) -> torch.Tensor:
+        """Current real tilt poles, shape (tilt_poles,)."""
+        return MAX_TILT_POLE * torch.tanh(self.raw_tilt)
+
+    def formants_hz(self, params: torch.Tensor) -> torch.Tensor:
+        """Formant frequencies (..., 4) in Hz from (..., 13) parameter frames (float64)."""
+        normalized = params.double().index_select(-1, self.formant_index)
+        return normalized * (BYTE_SCALE * FORMANT_SCALE)
+
+    def forward(self, params: torch.Tensor) -> torch.Tensor:
+        """
+        Convert parameter frames to LPC coefficients.
+
+        Accepts (B, T, 13), (T, 13) or (13,) like :class:`ParamToLPC`.
+
+        Returns:
+            float64 tensor (B, T, order) in the ``1 - sum a_i z^-i`` convention.
+        """
+        theta, radius = self._poles(params)
+        ones = torch.ones_like(theta[..., 0:1])
+
+        poly = ones
+        for i in range(len(FORMANT_NAMES)):
+            section = torch.cat(
+                [ones, -2 * radius[i] * torch.cos(theta[..., i : i + 1]), radius[i] ** 2 * ones],
+                dim=-1,
+            )
+            poly = _poly_mul(poly, section)
+        for pole in self.tilt():
+            poly = _poly_mul(poly, torch.cat([ones, -pole * ones], dim=-1))
+
+        # A(z) = 1 + sum c_i z^-i  ->  1 - sum a_i z^-i with a_i = -c_i
+        return -poly[..., 1:]
+
+    def numerator(self, params: torch.Tensor) -> Optional[torch.Tensor]:
+        """
+        FIR numerator N(z) of VocalTract's complex resonator cascade (see class docstring).
+
+        Returns:
+            float64 tensor (B, T, 5) of coefficients [n_0, ..., n_4] of
+            ``N(z) = sum n_k z^-k``, or None when ``complex_resonators`` is False.
+        """
+        if not self.complex_resonators:
+            return None
+        theta, radius = self._poles(params)
+        poly = torch.exp(1j * theta.sum(dim=-1, keepdim=True))  # e^{j sum theta}, (B, T, 1)
+        one = torch.ones_like(poly)
+        for i in range(len(FORMANT_NAMES)):
+            # conj(Q) factor: 1 - r e^{-j theta} z^-1
+            poly = _poly_mul(poly, torch.cat([one, -radius[i] * torch.exp(-1j * theta[..., i : i + 1])], -1))
+        return poly.real
+
+    def _poles(self, params: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Pole angles (B, T, 4) and radii (4,) for (..., 13) parameter frames."""
+        theta = 2 * torch.pi * self.formants_hz(_as_frames(params)) / self.sample_rate
+        radius = torch.exp(-torch.pi * self.bandwidths_hz() / self.sample_rate)
+        return theta, radius
+
+
+def make_mapper(kind: str = "formant", sample_rate: int = 16000) -> nn.Module:
+    """Build a parameter -> LPC mapper: ``"formant"`` (FormantToLPC) or ``"mlp"`` (ParamToLPC)."""
+    if kind == "formant":
+        return FormantToLPC(sample_rate=sample_rate)
+    if kind == "mlp":
+        return ParamToLPC()
+    raise ValueError(f"unknown mapper {kind!r}, expected 'formant' or 'mlp'")
 
 
 if __name__ == "__main__":

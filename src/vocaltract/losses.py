@@ -63,8 +63,18 @@ def spectral_convergence(pred_mag: torch.Tensor, target_mag: torch.Tensor) -> to
     return torch.linalg.norm(target_mag - pred_mag) / (torch.linalg.norm(target_mag) + EPS)
 
 
-def log_magnitude_l1(pred_mag: torch.Tensor, target_mag: torch.Tensor) -> torch.Tensor:
-    """Mean absolute difference of log magnitudes."""
+def log_magnitude_l1(
+    pred_mag: torch.Tensor, target_mag: torch.Tensor, floor: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """
+    Mean absolute difference of log magnitudes.
+
+    With ``floor``, compares ``log(mag + floor)``: bins far below the floor
+    count for (almost) nothing, so the loss ignores inaudible detail such as a
+    recording's or an engine's noise floor.
+    """
+    if floor is not None:
+        pred_mag, target_mag = pred_mag + floor, target_mag + floor
     return (target_mag.log() - pred_mag.log()).abs().mean()
 
 
@@ -77,6 +87,9 @@ class MultiScaleSTFTLoss(nn.Module):
         ffts: FFT sizes, one per scale.
         hops: Hop length per scale. Defaults to ``n_fft // 4``.
         win_lengths: Window length per scale. Defaults to ``n_fft``.
+        log_floor_db: Dynamic range of the log term. When set, magnitudes
+            are floored at the target's peak magnitude (per scale and batch
+            item) minus this many dB before taking logs. None: no floor.
     """
 
     def __init__(
@@ -84,8 +97,10 @@ class MultiScaleSTFTLoss(nn.Module):
         ffts: Sequence[int] = (512, 1024, 2048),
         hops: Optional[Sequence[int]] = None,
         win_lengths: Optional[Sequence[int]] = None,
+        log_floor_db: Optional[float] = None,
     ):
         super().__init__()
+        self.log_floor_db = log_floor_db
         self.ffts = tuple(ffts)
         self.hops = tuple(hops) if hops is not None else tuple(n // 4 for n in self.ffts)
         self.win_lengths = tuple(win_lengths) if win_lengths is not None else self.ffts
@@ -117,7 +132,12 @@ class MultiScaleSTFTLoss(nn.Module):
         for n_fft, hop, win_length in zip(self.ffts, self.hops, self.win_lengths):
             pred_mag = stft_magnitude(pred, n_fft, hop, win_length)
             target_mag = stft_magnitude(target, n_fft, hop, win_length)
+            floor = None
+            if self.log_floor_db is not None:
+                peak = target_mag.detach().amax(dim=(-2, -1), keepdim=True)
+                floor = peak * 10 ** (-self.log_floor_db / 20)
             scale_losses.append(
-                spectral_convergence(pred_mag, target_mag) + log_magnitude_l1(pred_mag, target_mag)
+                spectral_convergence(pred_mag, target_mag)
+                + log_magnitude_l1(pred_mag, target_mag, floor)
             )
         return torch.stack(scale_losses).mean()

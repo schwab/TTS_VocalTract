@@ -118,3 +118,26 @@ class TestGradients:
             assert t.grad is not None
             assert torch.isfinite(t.grad).all()
             assert t.grad.abs().sum() > 0
+
+
+class TestLogFloor:
+    def test_none_matches_default(self):
+        pred, target = tone(440.0), tone(445.0)
+        assert MultiScaleSTFTLoss(log_floor_db=None)(pred, target) == MultiScaleSTFTLoss()(pred, target)
+
+    def test_floor_ignores_content_far_below_peak(self):
+        """Noise 100 dB below the peak matters without a floor and barely with one."""
+        target = tone(440.0)
+        quiet = target + 1e-5 * torch.randn(target.shape, generator=torch.Generator().manual_seed(0))
+        plain = MultiScaleSTFTLoss()(quiet, target).item()
+        floored = MultiScaleSTFTLoss(log_floor_db=60)(quiet, target).item()
+        assert plain > 0.5 and floored < 0.01
+
+    def test_floor_still_sees_audible_differences(self):
+        floored = MultiScaleSTFTLoss(log_floor_db=60)
+        assert floored(tone(440.0), tone(470.0)).item() > 0.5
+
+    def test_gradient_finite(self):
+        pred = tone(440.0).requires_grad_()
+        MultiScaleSTFTLoss(log_floor_db=80)(pred, tone(450.0)).backward()
+        assert torch.isfinite(pred.grad).all()
