@@ -152,7 +152,7 @@ TTS_VocalTract/
 - All poles lie strictly inside the unit circle, with radius ≤ γ (verified in `test_mapper.py` by checking the roots of the LPC polynomial for a batch of random inputs, including saturated ones).
 - Gradients flow through `mapper` — `A.sum().backward()` populates `mapper` parameter grads.
 
-#### Addendum — review of the Step 7 output (2026-10-11)
+#### Addendum — review of the Step 7 output (2026-10-11; full notes and reproduction in `docs/reviews/phase1_step7_review.md`)
 
 **Finding: unused pole pairs get stuck and create resonances the target doesn't have.** Order 10 is five conjugate
 pole pairs, and `vt_vowel_ah` has four formants. After `overfit_demo --freeze aa=0` (500 steps), the trained
@@ -233,7 +233,7 @@ Acceptance check for either: on `vt_vowel_ah`, no resonance above 4 kHz, and fou
 - No NaN/Inf for random inputs in [0, 1].
 - Gradients flow from output to `params`.
 
-#### Addendum — review of the Step 7 output (2026-10-11)
+#### Addendum — review of the Step 7 output (2026-10-11; full notes and reproduction in `docs/reviews/phase1_step7_review.md`)
 
 **Finding: the fixed 1/k source tilt is wrong for VocalTract, and the filter compensates by smearing F1/F2.**
 In `vt_vowel_ah` the fundamental is about 25 dB below the strongest harmonic (h6, at F1). The spectrum *rises*
@@ -270,7 +270,7 @@ harmonic), and F1/F2 bandwidths under 150 Hz.
 - `loss = MultiScaleSTFTLoss()(pred, target)` returns a scalar tensor with `requires_grad=True` when `pred` does.
 - `test_gradients.py` asserts the loss decreases after a single optimizer step on a toy problem.
 
-#### Addendum — review of the Step 7 output (2026-10-11)
+#### Addendum — review of the Step 7 output (2026-10-11; full notes and reproduction in `docs/reviews/phase1_step7_review.md`)
 
 **Checked, no change needed.** It seemed possible that the log-magnitude term ignores the quiet high band because
 of its floor. It doesn't: `EPS = 1e-7`, while the quietest 4–8 kHz STFT magnitudes of `vt_vowel_ah` are about
@@ -337,7 +337,7 @@ pole local minimum described in the Step 2 addendum, not the loss.
 
 Pitch ends within 0.8 Hz of the target on every clip.
 
-#### Addendum — review of the Step 7 output (2026-10-11)
+#### Addendum — review of the Step 7 output (2026-10-11; full notes and reproduction in `docs/reviews/phase1_step7_review.md`)
 
 **Measured** (`vt_vowel_ah`, `--freeze aa=0`, 500 steps, default order-10 mapper):
 
@@ -345,7 +345,7 @@ Pitch ends within 0.8 Hz of the target on every clip.
 |---|---|---|
 | Pitch (Praat) | 119.96 Hz | 119.75 Hz (3 cents) |
 | F1 / F2 / F3 / F4 | 725 / 1082 / 2440 / ~3400 Hz | 658 / 1080 / 2383 Hz / missing |
-| Harmonic-level RMS error | | 10.2 dB below 4 kHz, 32.3 dB above |
+| Harmonic-level RMS error (compare pane) | | 10.2 dB below 4 kHz, 32.3 dB above (`scripts/step7_diagnostics.py`: 8.8 / 28.2) |
 
 **Recommended additions to the demo's report** (cheap, and they make the two remaining gaps visible in numbers):
 - The trained filter's pole frequencies and bandwidths at the middle frame.
