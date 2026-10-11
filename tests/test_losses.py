@@ -87,6 +87,16 @@ class TestValues:
         assert torch.isfinite(loss)
         assert torch.isfinite(pred.grad).all()
 
+    def test_finite_grad_on_denormal_audio(self):
+        """
+        Near-silent predictions (float32 denormals, ~1e-40) make |z| round to 0
+        while z != 0; the gradient z/|z| must not become inf/NaN.
+        """
+        torch.manual_seed(0)
+        pred = (torch.randn(1, 4096) * 1e-40).requires_grad_()
+        MultiScaleSTFTLoss()(pred, torch.randn(1, 4096)).backward()
+        assert torch.isfinite(pred.grad).all()
+
     def test_components(self):
         mag = stft_magnitude(torch.randn(2, 4096), n_fft=512, hop=128, win_length=512)
         assert mag.shape == (2, 257, 4096 // 128 + 1)
