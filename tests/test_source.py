@@ -5,7 +5,12 @@ import pytest
 import torch
 
 from vocaltract.params import PARAM_NAMES, denormalize
-from vocaltract.source import make_excitation, sine_from_frequency, upsample_frames
+from vocaltract.source import (
+    harmonics_from_frequency,
+    make_excitation,
+    sine_from_frequency,
+    upsample_frames,
+)
 
 SR = 16000
 GP, GA, AA = (PARAM_NAMES.index(n) for n in ("gp", "ga", "aa"))
@@ -63,8 +68,10 @@ class TestNumerics:
 
     def test_amplitude_scaling(self):
         """Voiced part peaks near ga; noise std tracks aa."""
-        voiced = make_excitation(constant_params(50, gp=0.5, ga=0.3, aa=0.0))
-        assert voiced.abs().max().item() == pytest.approx(0.3, rel=1e-3)
+        sine = make_excitation(constant_params(50, gp=0.5, ga=0.3, aa=0.0), max_harmonics=1)
+        assert sine.abs().max().item() == pytest.approx(0.3, rel=1e-3)
+        harmonic = make_excitation(constant_params(50, gp=0.5, ga=0.3, aa=0.0))
+        assert 0.25 < harmonic.abs().max().item() < 0.36  # sawtooth ~1 plus Gibbs overshoot
 
         torch.manual_seed(0)
         noisy = make_excitation(constant_params(50, gp=0.5, ga=0.0, aa=0.2))
@@ -77,13 +84,55 @@ class TestNumerics:
         assert torch.equal(a, b)
 
 
+class TestHarmonics:
+    def test_harmonics_present_with_inverse_k_amplitudes(self):
+        f0 = 200.0
+        out = harmonics_from_frequency(torch.full((1, SR), f0), SR)[0].numpy()
+        spectrum = np.abs(np.fft.rfft(out))  # 1 Hz bins, integer-period signal: no window needed
+        fundamental = spectrum[int(f0)]
+        for k in (2, 3, 5, 10, 37):  # 37 * 200 = 7400 Hz, below the Nyquist taper
+            assert spectrum[int(k * f0)] / fundamental == pytest.approx(1 / k, rel=1e-3), k
+
+    def test_no_energy_at_or_above_nyquist_or_between_harmonics(self):
+        """f0 = 3000 Hz: only 3000 and 6000 Hz fit below 8 kHz; 9000 Hz would alias to 7000."""
+        out = harmonics_from_frequency(torch.full((1, SR), 3000.0), SR)[0].numpy()
+        spectrum = np.abs(np.fft.rfft(out))
+        strong = set(np.flatnonzero(spectrum > 1e-3 * spectrum.max()))
+        assert strong == {3000, 6000}  # 6000 Hz is 2 kHz below Nyquist: full weight
+
+    def test_continuous_as_harmonic_crosses_nyquist(self):
+        """The Nyquist taper fades harmonics out, so output changes smoothly with pitch."""
+        n = 64  # short, so phase drift between the two pitches is negligible
+        f_cross = 8000.0 / 5  # 5th harmonic sits exactly at Nyquist
+        below = harmonics_from_frequency(torch.full((1, n), f_cross - 1e-3, dtype=torch.float64), SR)
+        above = harmonics_from_frequency(torch.full((1, n), f_cross + 1e-3, dtype=torch.float64), SR)
+        # A hard cutoff would jump by the 5th harmonic's full amplitude (2/pi/5 ~= 0.13).
+        assert (below - above).abs().max().item() < 1e-3
+
+    def test_harmonic_count_follows_lowest_pitch(self):
+        """A pitch sweep keeps every harmonic below Nyquist at every sample."""
+        f = torch.linspace(60.0, 900.0, SR)[None]
+        out = harmonics_from_frequency(f, SR)
+        assert torch.isfinite(out).all()
+
+    def test_max_harmonics_one_is_pure_sine(self):
+        f = torch.full((2, 1000), 330.0)
+        assert torch.allclose(harmonics_from_frequency(f, SR, max_harmonics=1), sine_from_frequency(f, SR))
+
+    def test_excitation_pitch_is_fundamental(self):
+        """The fundamental is still the strongest component."""
+        params = constant_params(50, gp=0.5, ga=1.0, aa=0.0)
+        out = make_excitation(params, sample_rate=SR, hop=320)[0].numpy()
+        assert abs(peak_frequency(out) - denormalize(params)["gp"][0, 0].item()) < 2.0
+
+
 class TestPhaseContinuity:
     def test_no_jumps_when_pitch_changes(self):
         """A pitch sweep has no sample-to-sample jumps larger than the max frequency allows."""
         params = torch.zeros(1, 50, 13)
         params[..., GA] = 1.0
         params[..., GP] = torch.linspace(0.0, 1.0, 50)
-        out = make_excitation(params, sample_rate=SR, hop=320)[0]
+        out = make_excitation(params, sample_rate=SR, hop=320, max_harmonics=1)[0]
 
         max_hz = denormalize(params)["gp"].max().item()
         max_step = 2 * np.pi * max_hz / SR  # |d sin| <= |d phase|
