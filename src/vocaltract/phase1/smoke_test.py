@@ -3,7 +3,7 @@ Gradient-flow smoke test for the full Phase 1 pipeline.
 
 Runs one forward/backward pass through every stage:
 
-    params (1, 50, 13) --ParamToLPC--> coeffs (1, 50, order)
+    params (1, 50, 13) --FormantToLPC--> coeffs (1, 50, order)
                        --frames_to_samples--> coeffs (1, 50*hop, order)
     params --make_excitation--> excitation (1, 50*hop), scaled by 1 / filter peak gain
     (excitation, coeffs) --LPCFilter--> audio (1, 50*hop)
@@ -24,7 +24,7 @@ from typing import Dict, List, Tuple
 
 import torch
 
-from vocaltract.mapper import ParamToLPC
+from vocaltract.mapper import make_mapper
 from vocaltract.params import PARAM_DIM
 from vocaltract.pipeline import synthesize_trace
 
@@ -47,7 +47,9 @@ class SmokeResult:
         return not self.failures
 
 
-def run_smoke_test(seed: int = 0, num_frames: int = NUM_FRAMES, hop: int = HOP) -> SmokeResult:
+def run_smoke_test(
+    seed: int = 0, num_frames: int = NUM_FRAMES, hop: int = HOP, mapper_kind: str = "formant"
+) -> SmokeResult:
     """
     Run params -> mapper -> source -> filter -> audio -> loss -> backward.
 
@@ -55,13 +57,14 @@ def run_smoke_test(seed: int = 0, num_frames: int = NUM_FRAMES, hop: int = HOP) 
         seed: Seed for ``torch.manual_seed`` (params, mapper init, noise).
         num_frames: Number of parameter frames.
         hop: Samples per frame.
+        mapper_kind: ``"formant"`` (default) or ``"mlp"``, see :func:`make_mapper`.
 
     Returns:
         A :class:`SmokeResult` with shapes, loss, gradient norm and any failures.
     """
     torch.manual_seed(seed)
     params = torch.rand(1, num_frames, PARAM_DIM, requires_grad=True)
-    mapper = ParamToLPC()
+    mapper = make_mapper(mapper_kind, SAMPLE_RATE)
 
     trace = synthesize_trace(params, mapper, hop=hop, sample_rate=SAMPLE_RATE)
     audio = trace.audio
@@ -86,7 +89,7 @@ def run_smoke_test(seed: int = 0, num_frames: int = NUM_FRAMES, hop: int = HOP) 
 
 
 def _check(
-    audio: torch.Tensor, loss: torch.Tensor, grad: torch.Tensor, mapper: ParamToLPC
+    audio: torch.Tensor, loss: torch.Tensor, grad: torch.Tensor, mapper: torch.nn.Module
 ) -> List[str]:
     """Collect failure messages (explicit checks, so they survive ``python -O``)."""
     failures = []

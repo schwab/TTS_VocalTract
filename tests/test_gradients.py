@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from vocaltract.losses import MultiScaleSTFTLoss
-from vocaltract.mapper import ParamToLPC
+from vocaltract.mapper import make_mapper
 from vocaltract.params import PARAM_NAMES
 from vocaltract.pipeline import synthesize as pipeline_synthesize
 
@@ -12,7 +12,7 @@ HOP = 160
 GP = PARAM_NAMES.index("gp")
 
 
-def synthesize(params: torch.Tensor, mapper: ParamToLPC, seed: int = 0) -> torch.Tensor:
+def synthesize(params: torch.Tensor, mapper: torch.nn.Module, seed: int = 0) -> torch.Tensor:
     """params (B, T_frames, 13) -> audio (B, T_frames * HOP), with fixed-seed noise."""
     return pipeline_synthesize(params, mapper, hop=HOP, generator=torch.Generator().manual_seed(seed))
 
@@ -37,17 +37,19 @@ class TestToyProblem:
 
 
 class TestEndToEnd:
-    def test_grads_reach_params(self):
+    @pytest.mark.parametrize("kind", ["formant", "mlp"])
+    def test_grads_reach_params(self, kind):
         torch.manual_seed(0)
         params = torch.rand(1, 20, 13, requires_grad=True)
         target = torch.randn(1, 20 * HOP)
-        MultiScaleSTFTLoss()(synthesize(params, ParamToLPC()), target).backward()
+        MultiScaleSTFTLoss()(synthesize(params, make_mapper(kind)), target).backward()
         assert params.grad is not None
         assert torch.isfinite(params.grad).all()
         assert params.grad.abs().sum() > 0
 
+    @pytest.mark.parametrize("kind", ["formant", "mlp"])
     @pytest.mark.parametrize("seed", range(5))
-    def test_one_step_reduces_loss(self, seed):
+    def test_one_step_reduces_loss(self, seed, kind):
         """
         One Adam step on params moves the synthesized audio toward a target clip.
 
@@ -57,7 +59,7 @@ class TestEndToEnd:
         gp over ~1e-7. The overfit demo uses --pitch-lr-scale for this reason.
         """
         torch.manual_seed(seed)
-        mapper = ParamToLPC()
+        mapper = make_mapper(kind)
         target = synthesize(torch.rand(1, 20, 13), mapper, seed=1).detach()
 
         params = torch.rand(1, 20, 13, requires_grad=True)

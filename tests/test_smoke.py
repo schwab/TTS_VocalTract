@@ -3,9 +3,10 @@
 import subprocess
 import sys
 
+import pytest
 import torch
 
-from vocaltract.mapper import ParamToLPC
+from vocaltract.mapper import make_mapper
 from vocaltract.params import PARAM_NAMES
 from vocaltract.phase1 import smoke_test
 from vocaltract.pipeline import synthesize
@@ -24,11 +25,16 @@ def test_deterministic():
     assert a.loss == b.loss and a.grad_norm == b.grad_norm
 
 
-def test_gradient_reaches_both_paths():
+def test_mlp_mapper_passes():
+    assert smoke_test.run_smoke_test(mapper_kind="mlp").ok
+
+
+@pytest.mark.parametrize("kind", ["formant", "mlp"])
+def test_gradient_reaches_both_paths(kind):
     """Formant params only reach audio via the mapper; gp only via the source."""
     torch.manual_seed(0)
     params = torch.rand(1, 10, 13, requires_grad=True)
-    synthesize(params, ParamToLPC(), hop=64).pow(2).mean().backward()
+    synthesize(params, make_mapper(kind), hop=64).pow(2).mean().backward()
     for name in ("f1", "f2", "f3", "f4", "gp"):
         assert params.grad[..., PARAM_NAMES.index(name)].abs().sum() > 0, name
 
