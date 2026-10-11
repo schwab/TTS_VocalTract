@@ -6,5 +6,8 @@ soundfile
 numba            # reference engine (vocaltract.reference); optional but ~100x faster
 praat-parselmouth  # analysis/resynthesis (vocaltract.analysis)
 matplotlib       # analysis plots
+openai-whisper   # intelligibility metric (Whisper WER)
+jiwer
+pystoi
 pytest
 tqdm
