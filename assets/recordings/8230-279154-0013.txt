@@ -1,0 +1,1 @@
+in an image of a well known face for example some parts may feel more familiar than others when this happens we have more belief in the accuracy of the familiar parts than in that of the unfamiliar parts

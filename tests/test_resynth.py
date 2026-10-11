@@ -165,9 +165,14 @@ def test_word_error_rate_counts():
 def test_reference_transcripts_exist_for_sample_recordings():
     from pathlib import Path
     from vocaltract.analysis.intelligibility import reference_for
+    import json
     rec = Path(__file__).resolve().parents[1] / "assets" / "recordings"
-    for clip in ("198-209-0000.ogg", "5703-47212-0000.ogg"):
-        assert len(reference_for(rec / clip).split()) > 30
+    manifest = json.loads((rec / "manifest.json").read_text())
+    assert len(manifest) == 10 and sum(e["gender"] == "F" for e in manifest) == 5
+    for e in manifest:
+        assert (rec / e["file"]).exists()
+        assert len(reference_for(rec / e["file"]).split()) >= 25
+        assert e["original_wer"] <= 0.05
 
 
 def test_compare_spectrogram_and_encoding():

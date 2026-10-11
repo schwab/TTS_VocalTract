@@ -97,10 +97,11 @@ VocalTract source model plus whole-utterance fitting, measured by WER**:
 - Support a 10 ms frame hop (160 samples at 16 kHz) next to 20 ms.
 - Report WER (`vocaltract.analysis.intelligibility`) for: the original, the level-A init, and the fit. Also report
   harmonic error and write a compare page (`vocaltract.analysis.compare`).
-- Data: the two LibriSpeech sentences in `assets/recordings/`. Add a few more (5–10, mixed speakers) so WER isn't
-  decided by two sentences. I can add these.
-- *Acceptance:* the harness runs end to end on both sentences, and the fit's WER is no worse than level A's
-  (43% / 47%).
+- Data: the ten-sentence set in `assets/recordings/` (5 female, 5 male, f0 83–212 Hz; added 2026-10-11, see the
+  addendum below). Loop over `manifest.json`. Report **corpus WER** (total errors / total words), the median clip,
+  and the worst clip.
+- *Acceptance:* the harness runs end to end on all ten. The fit's corpus WER is no worse than level A's (36%), and
+  no clip is worse than its own `level_a_wer`.
 
 **2.2 Frication source (`fa`, `ff`).**
 - Engine behaviour (`src/vocaltract/reference/engine.py`, "frication" block): a sine at `ff` whose phase is jittered
@@ -141,8 +142,8 @@ VocalTract source model plus whole-utterance fitting, measured by WER**:
 
 ### Phase 2 goals and non-goals
 
-- **Gate:** WER on the sentence set at **≤ 20%** (level A: 43–47%; originals: 2–3%), with a stretch target of
-  ≤ 10%. Listening checks alongside, since Whisper's language model is forgiving on predictable sentences.
+- **Gate:** corpus WER on the ten-sentence set **≤ 15%** with **no clip above 40%** (level A: 36% corpus, 23.5%
+  median clip, worst 133%; originals: 0–3%). Stretch target: ≤ 8% corpus. Listening checks alongside, since Whisper's language model is forgiving on predictable sentences.
 - **Interpretability check:** self mode recovers every modelled parameter, now including `fa`, `ff`, `na`, `nf`,
   `vp` and `vr`.
 - **Non-goals:**
@@ -157,3 +158,33 @@ VocalTract source model plus whole-utterance fitting, measured by WER**:
   initialization.
 - **Phase 4's** "formant tracking loss" partly exists already as `vocaltract.formants` and the harmonic measures.
   Revisit its scope when Phase 3 starts.
+
+## Addendum: the ten-sentence evaluation set (2026-10-11)
+
+`assets/recordings/` now has ten sentences: the original two, plus eight from LibriSpeech test-clean (4 female,
+4 male, chosen so the originals score 0% WER). `manifest.json` records each clip's original and level-A WER. Level A
+(`python -m vocaltract.analysis.resynth <clip> --asr small.en`, default settings):
+
+| Clip | Speaker | f0 | Original WER | Level-A WER |
+|---|---|---|---|---|
+| 8230-279154-0013 | M | 105 Hz | 0% | 3% |
+| 2094-142345-0006 | F | 194 Hz | 0% | 8% |
+| 2961-960-0019 | F | 167 Hz | 0% | 17% |
+| 7729-102255-0015 | M | 91 Hz | 0% | 20% |
+| 8463-294828-0035 | F | 145 Hz | 0% | 22% |
+| 7127-75946-0002 | M | 125 Hz | 0% | 25% |
+| 3575-170457-0015 | F | 199 Hz | 0% | 29% |
+| 198-209-0000 | F | 212 Hz | 2% | 43% |
+| 5703-47212-0000 | M | 83 Hz | 3% | 47% |
+| 6930-75918-0001 | M | 156 Hz | 0% | **133%** |
+| **Corpus** | | | | **36%** (144 errors / 400 words) |
+
+**What this changes:**
+- The two original clips were the hardest of the set, not typical. The "43–47%" baseline overstated the gap, so
+  the Phase 2 gate above has been restated on the corpus.
+- **6930 is a hard case worth keeping.** A fast, breathy reader on a recording with an audible hiss floor. Pitch
+  tracking is fine (median error 9 cents). But level A voices only 16% of frames (the original: 42%) and renders
+  much of the speech as frication and aspiration noise, so Whisper hallucinates. It is a direct test of Phase 2's
+  frication (2.2) and voice-quality (2.5) work, and of noise robustness in the analysis.
+- Spread matters: per-clip WER ranges from 3% to 133% on the same settings, so report the corpus figure, the median
+  and the worst clip, not one sentence.

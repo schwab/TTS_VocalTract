@@ -1,0 +1,1 @@
+at the edge of this box there lies a great wooden doll which so far as mutilation is concerned bears a strong resemblance to the finest greek sculpture and especially in the total loss of its nose

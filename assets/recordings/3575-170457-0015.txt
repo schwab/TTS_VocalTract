@@ -1,0 +1,1 @@
+but do not suppose that i disparage the gift which you possess nor that i would discourage you from exercising it i only exhort you so to think of it and so to use it as to render it conducive to your own permanent good
