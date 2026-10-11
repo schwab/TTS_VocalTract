@@ -178,13 +178,47 @@ def _clean(values, digits: int = 1) -> list:
 # page data
 # ---------------------------------------------------------------------------
 
-def praat_tracks(clip: Clip, hop: float = 0.01) -> dict:
+def harmonic_levels(audio: np.ndarray, sr: int, times: np.ndarray, f0: np.ndarray,
+                    fmax: float) -> list:
+    """Level of each harmonic k*f0 (k = 1.. up to fmax) per frame, dB re the clip's loudest harmonic.
+
+    Each level is the spectral peak within +/- f0/4 of k*f0, from a Hann window
+    of three periods of the clip's median pitch (25-60 ms). Unvoiced frames are
+    ``None``. Levels below FLOOR_DB are clipped to it.
+    """
+    x = np.asarray(audio, dtype=np.float64)
+    voiced = np.isfinite(f0) & (f0 > 0)
+    out: list = [None] * len(times)
+    if not voiced.any():
+        return out
+    nper = int(np.clip(3 / np.median(f0[voiced]), 0.025, 0.06) * sr)
+    nfft = 1 << int(np.ceil(np.log2(4 * nper)))
+    window = np.hanning(nper)
+    padded = np.pad(x, (nper, nper))
+    top = min(fmax, sr / 2)
+    rows = {}
+    for i in np.flatnonzero(voiced):
+        start = int(round(times[i] * sr)) + nper - nper // 2
+        mag = np.abs(np.fft.rfft(padded[start:start + nper] * window, nfft))
+        k = np.arange(1, int(top / f0[i]) + 1)
+        lo = np.floor((k - 0.25) * f0[i] * nfft / sr).astype(int)
+        hi = np.minimum(np.ceil((k + 0.25) * f0[i] * nfft / sr).astype(int) + 1, len(mag))
+        rows[i] = 20 * np.log10(np.array([mag[a:b].max() for a, b in zip(lo, hi)]) + 1e-12)
+    peak = max(r.max() for r in rows.values())
+    for i, r in rows.items():
+        out[i] = np.maximum(np.round(r - peak), FLOOR_DB).astype(int).tolist()
+    return out
+
+
+def praat_tracks(clip: Clip, hop: float = 0.01, fmax: float | None = None) -> dict:
+    """Praat pitch and formants, plus the harmonic levels along that pitch track."""
     from .features import track
 
     tr = track(clip.audio, clip.sr, hop)
     voiced = tr.voiced                      # formants are only meaningful where voiced
     return {"t": _clean(tr.times, 3), "f0": _clean(tr.f0),
-            "F": [_clean(np.where(voiced, tr.formants[:, i], np.nan), 0) for i in range(4)]}
+            "F": [_clean(np.where(voiced, tr.formants[:, i], np.nan), 0) for i in range(4)],
+            "H": harmonic_levels(clip.audio, clip.sr, tr.times, tr.f0, fmax or clip.sr / 2)}
 
 
 def frames_overlay(frames: np.ndarray, times: np.ndarray) -> dict:
@@ -215,7 +249,7 @@ def clip_payload(clip: Clip, fmax: float, *, praat: bool = True, words: list[dic
         "audio": base64.b64encode(wav_bytes(clip.audio, clip.sr)).decode("ascii") if embed_audio else None,
         "spec": clip_spectrograms(clip, fmax),
         "words": words or [],
-        "praat": praat_tracks(clip) if praat else None,
+        "praat": praat_tracks(clip, fmax=fmax) if praat else None,
     }
 
 
@@ -549,6 +583,7 @@ canvas.dragging{cursor:grabbing}
     <label id="lblPraat"><input type="checkbox" id="ovPraat"> Praat formants</label>
     <label id="lblWords"><input type="checkbox" id="ovWords" checked> words</label>
     <label id="lblDiff"><input type="checkbox" id="ovDiff"> difference</label>
+    <label id="lblHarm"><input type="checkbox" id="ovHarm" checked> harmonic levels</label>
   </div>
   <div class="group" id="serveControls">
     <button id="addTrack" title="add a track">+ track</button>
@@ -565,10 +600,10 @@ const D = JSON.parse(document.getElementById("data").textContent);
 const SERVE = !!D.serve;
 const RES = ["wide", "narrow"];
 const L = 46, R = 10;                      // plot margins (css px)
-const SPEC_H = 220, WORDS_H = 22, AXIS_H = 18, LANE_H = 110;
+const SPEC_H = 220, WORDS_H = 22, AXIS_H = 18, LANE_H = 110, HARM_H = 160, HDIFF_H = 100, HARM_STEP = 20;
 const CLIP_COLORS = ["#ffb000", "#35d0ff", "#ff5fa2", "#8ee05a", "#c08bff", "#ff7b39"];
 const state = {t0: 0, t1: 1, res: "wide", floor: -70, fmax: D.fmax, active: 0, cursor: 0,
-               ovFrames: true, ovPraat: false, ovWords: true, ovDiff: false};
+               ovFrames: true, ovPraat: false, ovWords: true, ovDiff: false, ovHarm: true};
 const $ = id => document.getElementById(id);
 const el = (tag, props = {}, ...kids) => { const e = Object.assign(document.createElement(tag), props); e.append(...kids); return e; };
 document.title = D.title; $("title").textContent = D.title;
@@ -724,11 +759,12 @@ function updateButtons() {
 // ---------- panes ----------
 let panes = [];
 const sw = (c, t) => `<span><span class="sw" style="background:${c}"></span>${t}</span>`;
-function makePane(kind, idx, head) {
+function makePane(kind, idx, head, timeAxis = true) {
   const div = el("div", {className: "pane"}), cv = el("canvas");
   div.append(el("div", {className: "head"}, ...head), cv); $("panes").appendChild(div);
   const p = {kind, idx, div, cv, ctx: cv.getContext("2d")};
-  attachInput(p); panes.push(p); return p;
+  if (timeAxis) attachInput(p); else cv.style.cursor = "default";
+  panes.push(p); return p;
 }
 function legend(html) { const s = el("span", {className: "legend"}); s.innerHTML = html; return s; }
 function fileSelect(current) {
@@ -778,6 +814,12 @@ function build() {
     legend(tracks.map((t, i) => loaded(t) && t.praat ? sw(CLIP_COLORS[i % 6], `Praat f0: ${t.name}`) : "").join("") + (frames ? sw("var(--text)", "frames gp") : ""))]);
   if (frames) makePane("amp", 0, [el("b", {textContent: "source amplitudes (frames)"}),
     legend(sw("#ff9f1c", "ga voice") + sw("#2ec4b6", "aa aspiration") + sw("#b388ff", "fa frication"))]);
+  const hasHarm = tracks.some(t => loaded(t) && t.praat && t.praat.H);
+  const harmPane = hasHarm ? makePane("harm", 0, [el("b", {textContent: "harmonic levels"}),
+    el("span", {className: "note", textContent: "voiced frames in view, each track re its loudest harmonic; below: difference vs track 1"}),
+    legend(tracks.map((t, i) => loaded(t) && t.praat && t.praat.H ? sw(CLIP_COLORS[i % 6], t.name) : "").join(""))], false) : null;
+  $("lblHarm").classList.toggle("hidden", !hasHarm);
+  if (harmPane) harmPane.div.classList.toggle("hidden", !state.ovHarm);
   $("lblFrames").classList.toggle("hidden", !frames);
   $("lblPraat").classList.toggle("hidden", !hasPraat);
   $("lblWords").classList.toggle("hidden", !tracks.some(t => t.words && t.words.length));
@@ -788,6 +830,7 @@ function build() {
 function paneHeight(p) {
   if (p.kind === "spec") return SPEC_H + (state.ovWords && tracks[p.idx].words.length ? WORDS_H : 0) + AXIS_H;
   if (p.kind === "diff") return SPEC_H + AXIS_H;
+  if (p.kind === "harm") return HARM_H + HDIFF_H + AXIS_H + 8;
   return LANE_H + AXIS_H;
 }
 function resize() {
@@ -928,11 +971,83 @@ function drawAmp(p) {
   line(p, frames.t, frames.fa, top, H, "#b388ff", ay);
   drawPlayhead(p, top, H); drawTimeAxis(p, LANE_H);
 }
+// Harmonic envelope of a track over the voiced frames in [t0, t1]: each frame's harmonic levels are
+// interpolated (in dB) onto a HARM_STEP Hz grid, averaged as power, then normalized to 0 dB peak.
+function harmEnvelope(t) {
+  const key = `${state.t0}|${state.t1}`;
+  if (t.harmCache && t.harmCache.key === key) return t.harmCache.env;
+  const n = Math.floor(D.fmax / HARM_STEP) + 1, acc = new Float64Array(n), cnt = new Uint32Array(n);
+  const P = t.praat;
+  for (let i = 0; i < P.t.length; i++) {
+    const H = P.H[i], f0 = P.f0[i];
+    if (!H || !f0 || P.t[i] < state.t0 || P.t[i] > state.t1) continue;
+    for (let g = Math.ceil(f0 / HARM_STEP); g < n; g++) {
+      const pos = g * HARM_STEP / f0 - 1, k = Math.floor(pos); if (k >= H.length - 1) break;
+      const db = H[k] + (H[k + 1] - H[k]) * (pos - k);
+      acc[g] += Math.pow(10, db / 10); cnt[g]++;
+    }
+  }
+  let env = new Array(n).fill(null), peak = -Infinity;
+  for (let g = 0; g < n; g++) if (cnt[g]) { env[g] = 10 * Math.log10(acc[g] / cnt[g]); peak = Math.max(peak, env[g]); }
+  env = env.map(v => v === null ? null : v - peak);
+  t.harmCache = {key, env}; return env;
+}
+function drawHarm(p) {
+  const c = p.ctx, W = p.w - L - R; c.clearRect(0, 0, p.w, p.h);
+  const top1 = 6, H1 = HARM_H - 12, top2 = HARM_H + 10, H2 = HDIFF_H - 14, RANGE = -D.floorStored;
+  const fx = f => L + f / state.fmax * W;
+  const y1 = db => top1 + H1 * Math.min(1, -db / RANGE), y2 = d => top2 + H2 * (0.5 - Math.max(-1, Math.min(1, d / D.diffRange)) / 2);
+  c.fillStyle = css("--grid"); c.fillRect(L, top1, W, H1); c.fillRect(L, top2, W, H2);
+  c.fillStyle = css("--axis"); c.font = "11px system-ui"; c.textAlign = "right"; c.textBaseline = "middle";
+  for (const v of [0, -25, -50, -75, -100]) c.fillText(v, L - 6, y1(v));
+  for (const v of [D.diffRange, 0, -D.diffRange]) c.fillText((v > 0 ? "+" : "") + v, L - 6, y2(v));
+  c.strokeStyle = css("--axis"); c.beginPath(); c.moveTo(L, y2(0)); c.lineTo(L + W, y2(0)); c.stroke();
+  c.textBaseline = "alphabetic";
+  const grid = f => f / HARM_STEP;
+  const series = tracks.map(t => loaded(t) && t.praat && t.praat.H ? harmEnvelope(t) : null);
+  const plot = (vals, top, H, scale, color) => {
+    c.save(); c.beginPath(); c.rect(L, top, W, H); c.clip();
+    c.strokeStyle = color; c.lineWidth = 1.6; c.beginPath(); let pen = false;
+    for (let g = 0; g < vals.length && g * HARM_STEP <= state.fmax; g++) {
+      const v = vals[g]; if (v === null) { pen = false; continue; }
+      const x = fx(g * HARM_STEP), y = scale(v); if (pen) c.lineTo(x, y); else c.moveTo(x, y); pen = true;
+    }
+    c.stroke(); c.restore();
+  };
+  series.forEach((e, i) => { if (e) plot(e, top1, H1, y1, CLIP_COLORS[i % 6]); });
+  const ref = series[0], stats = [];
+  if (ref) series.forEach((e, i) => {
+    if (!e || i === 0) return;
+    const d = e.map((v, g) => v === null || ref[g] === null ? null : v - ref[g]);
+    plot(d, top2, H2, y2, CLIP_COLORS[i % 6]);
+    const rms = (lo, hi) => { const v = d.filter((x, g) => x !== null && g * HARM_STEP >= lo && g * HARM_STEP < hi); return v.length ? Math.sqrt(v.reduce((a, x) => a + x * x, 0) / v.length) : null; };
+    const a = rms(0, 4000), b = rms(4000, state.fmax + 1);
+    stats.push([CLIP_COLORS[i % 6], `${i + 1}−1: RMS ${a === null ? "–" : a.toFixed(1)} dB < 4 kHz` + (b === null ? "" : `, ${b.toFixed(1)} dB above`)]);
+  });
+  if (!series.some(Boolean) || series.every(e => !e || e.every(v => v === null))) {
+    c.fillStyle = css("--muted"); c.font = "13px system-ui"; c.textAlign = "center";
+    c.fillText("no voiced frames in view", L + W / 2, top1 + H1 / 2);
+  }
+  c.font = "12px system-ui"; c.textAlign = "right"; c.textBaseline = "middle";
+  stats.forEach(([color, s], k) => {
+    const y = top2 + H2 - 10 - 16 * (stats.length - 1 - k), w = c.measureText(s).width + 10;
+    c.fillStyle = css("--panel"); c.globalAlpha = 0.85; c.fillRect(L + W - 4 - w, y - 8, w, 16); c.globalAlpha = 1;
+    c.fillStyle = color; c.fillText(s, L + W - 9, y);
+  });
+  c.textBaseline = "alphabetic";
+  const step = niceStep(state.fmax, Math.max(2, W / 80));
+  c.fillStyle = css("--axis"); c.strokeStyle = css("--axis"); c.font = "11px system-ui"; c.textAlign = "center";
+  const yA = HARM_H + HDIFF_H;
+  for (let f = 0; f <= state.fmax + 1e-6; f += step) {
+    const x = fx(f); c.beginPath(); c.moveTo(x, yA); c.lineTo(x, yA + 4); c.stroke();
+    c.fillText(f >= 1000 ? (f / 1000) + "k" : f, x, yA + 14);
+  }
+}
 function drawAll() {
   for (const p of panes) {
     if (p.div.classList.contains("hidden")) continue;
     if (p.kind === "spec") drawSpec(p); else if (p.kind === "diff") drawDiff(p);
-    else if (p.kind === "pitch") drawPitch(p); else drawAmp(p);
+    else if (p.kind === "pitch") drawPitch(p); else if (p.kind === "harm") drawHarm(p); else drawAmp(p);
   }
 }
 function loop() {
@@ -988,6 +1103,7 @@ $("floor").oninput = e => { state.floor = +e.target.value; $("floorv").textConte
 for (const f of [2000, 3000, 4000, 5000, 6000, 8000, 10000, 12000]) if (f < D.fmax) $("fmax").add(new Option((f / 1000) + " kHz", f));
 $("fmax").add(new Option((D.fmax / 1000).toFixed(1).replace(".0", "") + " kHz", D.fmax)); $("fmax").value = D.fmax;
 $("fmax").onchange = e => { state.fmax = +e.target.value; dirty = true; };
+$("ovHarm").onchange = e => { state.ovHarm = e.target.checked; build(); };
 for (const id of ["ovFrames", "ovPraat", "ovWords"]) $(id).onchange = e => { state[id] = e.target.checked; resize(); };
 $("ovDiff").onchange = e => { state.ovDiff = e.target.checked; if (diffPane) diffPane.div.classList.toggle("hidden", !state.ovDiff); resize(); };
 window.addEventListener("resize", resize);
@@ -1017,7 +1133,7 @@ function applyHash(h) {
   if (h.has("res") && RES.includes(h.get("res"))) { state.res = h.get("res"); $("res").value = state.res; }
   if (h.has("floor")) { state.floor = Math.max(-100, Math.min(-10, +h.get("floor"))); $("floor").value = state.floor; $("floorv").textContent = state.floor + " dB"; }
   if (h.has("fmax")) { state.fmax = Math.min(D.fmax, +h.get("fmax")); if (![...$("fmax").options].some(o => +o.value === state.fmax)) $("fmax").add(new Option(state.fmax + " Hz", state.fmax)); $("fmax").value = state.fmax; }
-  for (const [key, id] of [["frames", "ovFrames"], ["praat", "ovPraat"], ["words", "ovWords"], ["diff", "ovDiff"]])
+  for (const [key, id] of [["frames", "ovFrames"], ["praat", "ovPraat"], ["words", "ovWords"], ["diff", "ovDiff"], ["harm", "ovHarm"]])
     if (h.has(key)) { state[id] = h.get(key) === "1"; $(id).checked = state[id]; }
 }
 function writeHash() {

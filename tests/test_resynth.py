@@ -253,3 +253,17 @@ def test_sv_layer_export(tmp_path, vowel_resynth):
     assert "frames_f1_hz.csv" in names and "frames_pitch_hz.csv" in names and "words_orig.csv" in names
     f1 = np.loadtxt(tmp_path / "frames_f1_hz.csv", delimiter=",")
     assert f1.shape[1] == 2 and np.median(f1[:, 1]) == pytest.approx(700, abs=80)
+
+
+def test_harmonic_levels_follow_the_spectrum():
+    from vocaltract.analysis.compare import FLOOR_DB, harmonic_levels
+    sr = 16000
+    t = np.arange(sr) / sr
+    x = sum(10 ** (-6 * (k - 1) / 20) * np.sin(2 * np.pi * 125 * k * t) for k in range(1, 9))  # -6 dB per harmonic
+    times = np.arange(10, 90) / 100
+    f0 = np.full(len(times), 125.0)
+    f0[:5] = np.nan
+    H = harmonic_levels(x, sr, times, f0, fmax=1000)
+    assert H[0] is None and len(H[40]) == 8
+    assert np.allclose(np.diff(H[40][:8]), -6, atol=1)                  # slope recovered
+    assert max(max(h) for h in H if h) == 0 and min(min(h) for h in H if h) >= FLOOR_DB

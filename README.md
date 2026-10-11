@@ -167,6 +167,10 @@ add or remove tracks, a **Frames file** menu for `*_frames.csv` overlays, and a 
 when you pick a file and are cached. The selection is kept in the URL (`#files=a.wav,b.wav&framesfile=...`),
 so reloading or bookmarking restores it. **↻ rescan** picks up files written since the page loaded.
 
+The **harmonic levels** pane (both modes) plots each track's harmonic envelope: levels at k·f0 along the Praat
+pitch track, averaged over the voiced frames in view, with the difference vs track 1 and its RMS error below and
+above 4 kHz. Zoom in time to analyse a single vowel.
+
 ## Roadmap
 
 - [ ] **Phase 1** — Minimal differentiable LPC pipeline (random audio → params → LPC → reconstruction)

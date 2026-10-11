@@ -152,6 +152,38 @@ TTS_VocalTract/
 - All poles lie strictly inside the unit circle, with radius ≤ γ (verified in `test_mapper.py` by checking the roots of the LPC polynomial for a batch of random inputs, including saturated ones).
 - Gradients flow through `mapper` — `A.sum().backward()` populates `mapper` parameter grads.
 
+#### Addendum — review of the Step 7 output (2026-10-11)
+
+**Finding: unused pole pairs get stuck and create resonances the target doesn't have.** Order 10 is five conjugate
+pole pairs, and `vt_vowel_ah` has four formants. After `overfit_demo --freeze aa=0` (500 steps), the trained
+filter's poles at the middle frame (frequency/bandwidth, Hz) were:
+
+| Order | Poles | 4–6 kHz / 6–8 kHz level re peak (target −104 / −110 dB) | LSD |
+|---|---|---|---|
+| 10 (default) | 719/265, 1130/224, 2413/106, **4736/53**, 7955/117 | −74 / −79 | 15.6 |
+| 8 | 747/227, 1357/443, 2672/182, 8000/51, 8000/wide | −98 / −103 | 12.4 |
+| 12 | 0/wide, 728/276, 1138/227, 2411/73, 3286/57, **6765/55**, 8000/51 | −95 / −86 | 14.4 |
+
+- At order 10 the spare pair sits at 4.7 kHz with the narrowest bandwidth γ allows. That is the stray band in the
+  spectrogram, and the 4–8 kHz excess of +30 to +50 dB. **F4 (3.4 kHz) is not modelled at all.**
+- Order 8 removes the high-band excess but loses F4 and misplaces F2. Order 12 finds F4 but parks spare poles at
+  6.8 and 8 kHz. So the filter order isn't the fix. It's a local minimum: the loss does see the excess (see the
+  Step 5 addendum), but gradient descent doesn't move a resonance across 1–2 kHz of spectrum.
+
+**Recommendations, in order of preference:**
+1. **Formant-parameterized filter (also fixes the identifiability limitation below).** Build the all-pole filter as
+   a cascade of 2nd-order resonators, one per formant, with centre frequencies taken directly from `f1`–`f4`
+   (VocalTract's own structure) and bandwidths from a small learned head or fixed at about 100 Hz. Add at most one
+   extra real pole or low-order section for overall tilt. With no free resonances there's nowhere for a stray band
+   to come from, and `f1`–`f4` mean what they say. Stability is a pole radius < 1 per section, which is trivially
+   guaranteed.
+2. **Interim, if the MLP mapper stays:** initialize the reflection coefficients beyond 2×(number of formants) near
+   0, so spare sections start effectively disabled. Add a small penalty on pole pairs narrower than about 200 Hz
+   that sit above F4 + 500 Hz.
+
+Acceptance check for either: on `vt_vowel_ah`, no resonance above 4 kHz, and four resonances within 5% of
+730/1090/2440/3400 Hz.
+
 ---
 
 ### Step 3 — Wrap `torchlpc` as a differentiable filter module
@@ -201,6 +233,25 @@ TTS_VocalTract/
 - No NaN/Inf for random inputs in [0, 1].
 - Gradients flow from output to `params`.
 
+#### Addendum — review of the Step 7 output (2026-10-11)
+
+**Finding: the fixed 1/k source tilt is wrong for VocalTract, and the filter compensates by smearing F1/F2.**
+In `vt_vowel_ah` the fundamental is about 25 dB below the strongest harmonic (h6, at F1). The spectrum *rises*
+from 120 Hz to F1. The sawtooth source makes h1 the strongest harmonic. After training, harmonics 1–5 are still
++25, +16, +12, +10 and +6 dB too strong. The filter's only way to compensate is to widen F1/F2: 265/224 Hz pole
+bandwidths, against about 100 Hz in VocalTract (r = 0.984 at 20 kHz). The F2–F3 valley (1.5–2.3 kHz) ends about
+10 dB too shallow as a result.
+
+**Recommendation:** make the source tilt learnable, independent of the filter.
+- Simplest: `Σ_k sin(kφ) / k^α` with a learnable global α (init 1.0), plus a learnable one-pole high-pass on the
+  excitation for the weak fundamental.
+- Keep these as global (per-clip) learnables, not new frame parameters, so the 13-parameter schema is unchanged.
+- This is the first piece of the Phase 2 glottal model. Phase 2 replaces it with a pulse shape, and the
+  interface stays the same.
+
+Acceptance check: on `vt_vowel_ah`, harmonics 1–5 within ±6 dB of the target (relative to each clip's strongest
+harmonic), and F1/F2 bandwidths under 150 Hz.
+
 ---
 
 ### Step 5 — Multi-scale STFT loss
@@ -218,6 +269,13 @@ TTS_VocalTract/
 **Expected Output:**
 - `loss = MultiScaleSTFTLoss()(pred, target)` returns a scalar tensor with `requires_grad=True` when `pred` does.
 - `test_gradients.py` asserts the loss decreases after a single optimizer step on a toy problem.
+
+#### Addendum — review of the Step 7 output (2026-10-11)
+
+**Checked, no change needed.** It seemed possible that the log-magnitude term ignores the quiet high band because
+of its floor. It doesn't: `EPS = 1e-7`, while the quietest 4–8 kHz STFT magnitudes of `vt_vowel_ah` are about
+2e-4 (−102 dB re peak). The log-L1 term sees the +30 to +50 dB excess fine. The excess persists because of the
+pole local minimum described in the Step 2 addendum, not the loss.
 
 ---
 
@@ -278,6 +336,28 @@ TTS_VocalTract/
 | speech_female | 27.6 | 10.5 |
 
 Pitch ends within 0.8 Hz of the target on every clip.
+
+#### Addendum — review of the Step 7 output (2026-10-11)
+
+**Measured** (`vt_vowel_ah`, `--freeze aa=0`, 500 steps, default order-10 mapper):
+
+| | Target | Result |
+|---|---|---|
+| Pitch (Praat) | 119.96 Hz | 119.75 Hz (3 cents) |
+| F1 / F2 / F3 / F4 | 725 / 1082 / 2440 / ~3400 Hz | 658 / 1080 / 2383 Hz / missing |
+| Harmonic-level RMS error | | 10.2 dB below 4 kHz, 32.3 dB above |
+
+**Recommended additions to the demo's report** (cheap, and they make the two remaining gaps visible in numbers):
+- The trained filter's pole frequencies and bandwidths at the middle frame.
+- Harmonic-level RMS error below and above 4 kHz: levels sampled at k·f0, each clip relative to its strongest
+  harmonic. `vocaltract.analysis.compare.harmonic_levels` computes the levels.
+
+**Targets once the Step 2 and Step 4 addenda are in:** harmonic RMS error ≤ 5 dB below 4 kHz and ≤ 10 dB above,
+with all four formants within 5%.
+
+**To inspect visually:** `python -m vocaltract.analysis.compare --serve out`, then pick `*_target.wav`, the
+result and `*_initial.wav` as tracks. The **harmonic levels** pane plots each track's harmonic envelope (voiced
+frames in view) and the difference vs track 1, with the RMS errors above.
 
 ---
 
@@ -340,7 +420,7 @@ Pitch ends within 0.8 Hz of the target on every clip.
 ## Known Limitations (found in Step 7)
 
 - **Parameters are not identifiable through the MLP mapper.** In self-target mode the loss falls but parameter error grows (0.018 → 0.036 mean absolute error at `--perturb 0.05`); pitch error improves only from 32 to 27 cents. The mapper sees all 13 parameters, including ones Phase 1 does not model (`na`, `nf`, `ff`, `fa`), and a random network has no reason to place resonances at `f1`–`f4`, so many parameter settings sound alike. Fixing this needs a physically grounded mapper (formant frequencies → resonators), not more optimization.
-- **Harmonic energy is still short of the targets** (about a third on `vt_vowel_ah`, measured before the final mapper and loss fixes). Likely the same cause: the learned filter shape, not the source.
+- **Harmonic levels are still off the targets** (10 dB RMS below 4 kHz, 32 dB above on `vt_vowel_ah`). Two measured causes, each with a fix in its step's addendum: a spare pole pair stuck at 4.7 kHz (Step 2) and the fixed 1/k source tilt (Step 4).
 - **Pitch is only locally learnable.** Phase is a running sum of frequency, so a pitch error compounds over the clip; from a neutral start, pitch gets stuck in local minima of the spectral loss. Demos start from the target's `.npz` params.
 
 ---
