@@ -5,9 +5,11 @@ Runs one forward/backward pass through every stage:
 
     params (1, 50, 13) --ParamToLPC--> coeffs (1, 50, order)
                        --frames_to_samples--> coeffs (1, 50*hop, order)
-    params --make_excitation--> excitation (1, 50*hop)
+    params --make_excitation--> excitation (1, 50*hop), scaled by 1 / filter peak gain
     (excitation, coeffs) --LPCFilter--> audio (1, 50*hop)
     loss = audio.pow(2).mean();  loss.backward()
+
+(the chain is :func:`vocaltract.pipeline.synthesize_trace`)
 
 and checks that a non-zero, finite gradient reaches ``params``. Prints a shape
 trace, the loss and the gradient norm, and exits non-zero on failure so it can
@@ -22,10 +24,9 @@ from typing import Dict, List, Tuple
 
 import torch
 
-from vocaltract.filter import LPCFilter, frames_to_samples
 from vocaltract.mapper import ParamToLPC
 from vocaltract.params import PARAM_DIM
-from vocaltract.source import make_excitation
+from vocaltract.pipeline import synthesize_trace
 
 NUM_FRAMES = 50
 HOP = 320
@@ -62,18 +63,17 @@ def run_smoke_test(seed: int = 0, num_frames: int = NUM_FRAMES, hop: int = HOP) 
     params = torch.rand(1, num_frames, PARAM_DIM, requires_grad=True)
     mapper = ParamToLPC()
 
-    frame_coeffs = mapper(params)
-    sample_coeffs = frames_to_samples(frame_coeffs, hop)
-    excitation = make_excitation(params, sample_rate=SAMPLE_RATE, hop=hop)
-    audio = LPCFilter()(excitation, sample_coeffs)
+    trace = synthesize_trace(params, mapper, hop=hop, sample_rate=SAMPLE_RATE)
+    audio = trace.audio
     loss = audio.pow(2).mean()
     loss.backward()
 
     shapes = {
         "params": tuple(params.shape),
-        "lpc coeffs (frame)": tuple(frame_coeffs.shape),
-        "lpc coeffs (sample)": tuple(sample_coeffs.shape),
-        "excitation": tuple(excitation.shape),
+        "lpc coeffs (frame)": tuple(trace.frame_coeffs.shape),
+        "gain norm (frame)": tuple(trace.frame_norm.shape),
+        "lpc coeffs (sample)": tuple(trace.sample_coeffs.shape),
+        "excitation": tuple(trace.excitation.shape),
         "audio": tuple(audio.shape),
     }
     grad = params.grad

@@ -5,11 +5,10 @@ import sys
 
 import torch
 
-from vocaltract.filter import LPCFilter, frames_to_samples
 from vocaltract.mapper import ParamToLPC
 from vocaltract.params import PARAM_NAMES
 from vocaltract.phase1 import smoke_test
-from vocaltract.source import make_excitation
+from vocaltract.pipeline import synthesize
 
 
 def test_run_smoke_test_passes():
@@ -29,9 +28,7 @@ def test_gradient_reaches_both_paths():
     """Formant params only reach audio via the mapper; gp only via the source."""
     torch.manual_seed(0)
     params = torch.rand(1, 10, 13, requires_grad=True)
-    excitation = make_excitation(params, hop=64)
-    audio = LPCFilter()(excitation, frames_to_samples(ParamToLPC()(params), 64))
-    audio.pow(2).mean().backward()
+    synthesize(params, ParamToLPC(), hop=64).pow(2).mean().backward()
     for name in ("f1", "f2", "f3", "f4", "gp"):
         assert params.grad[..., PARAM_NAMES.index(name)].abs().sum() > 0, name
 
