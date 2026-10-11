@@ -1,7 +1,13 @@
 torch>=2.1
-torchlpc>=0.2
+torchlpc==0.7.2  # needs python3-dev headers to build its C++ extension
 numpy
 scipy
 soundfile
+numba            # reference engine (vocaltract.reference); optional but ~100x faster
+praat-parselmouth  # analysis/resynthesis (vocaltract.analysis)
+matplotlib       # analysis plots
+openai-whisper   # intelligibility metric (Whisper WER)
+jiwer
+pystoi
 pytest
 tqdm

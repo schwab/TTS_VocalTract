@@ -104,6 +104,43 @@ Training uses a combination of:
 3. **Adversarial loss (optional)** — multi-resolution discriminator for perceptual quality
 4. **Parameter reconstruction loss** — when training with a paired encoder/decoder
 
+## Reference Engine
+
+`vocaltract.reference` is a bit-faithful, non-differentiable Python port of the original
+`spin/VocalTract.spin` assembly engine. It uses the same 32-bit integer math, ROM tables,
+CORDIC resonators and frame interpolation. It is the ground truth for what the Propeller
+plays from a frame sequence. `reference/spin.py` holds the shared pieces for porting
+more Spin programs: a .spin CON/DAT parser, Spin's `?rnd`, the VocalTract object API,
+and the render/mix/CLI.
+
+```bash
+pip install numba soundfile    # numba is optional but ~100x faster
+python -m vocaltract.reference.singing_demo_seven         # out/singing_demo_seven.wav (faithful timing)
+python -m vocaltract.reference.singing_demo_seven --sync  # parts in lockstep
+python -m vocaltract.reference.singing_demo               # out/singing_demo.wav (held vowels)
+```
+
+### Analysis / resynthesis (level A)
+
+`vocaltract.analysis.resynth` maps a recording onto VocalTract frames with classic speech analysis
+(Praat pitch and formants, band levels, no ML), calibrates the source levels against the reference
+engine, and renders the result. It's a baseline for how much of a real voice fits in 13 bytes, and
+a starting point for gradient fitting.
+
+```bash
+pip install praat-parselmouth matplotlib
+python -m vocaltract.analysis.resynth assets/recordings/198-209-0000.ogg --spin
+# out/resynth/: _resynth.wav, _ab.wav (original then resynthesis), _frames.csv, .png, _player.spin
+```
+
+The `_player.spin` file plays the same frames on a real Propeller (P10/P11, needs `VocalTract.spin`).
+
+**Intelligibility metric.** The report includes the Whisper word error rate (WER) of the resynthesis
+next to the WER of the original recording (the floor), scored against `<clip>.txt` when present
+(`--asr none` to skip, `--asr base.en` for a faster model). Spectral metrics (log-mel distance, STOI)
+proved misleading on this project, so WER plus listening is the yardstick. To score any WAV:
+`python -m vocaltract.analysis.intelligibility file.wav --ref-file transcript.txt`.
+
 ## Roadmap
 
 - [ ] **Phase 1** — Minimal differentiable LPC pipeline (random audio → params → LPC → reconstruction)
