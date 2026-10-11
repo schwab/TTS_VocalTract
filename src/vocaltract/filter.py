@@ -91,7 +91,27 @@ def frames_to_samples(coeffs: torch.Tensor, hop: int) -> torch.Tensor:
     return coeffs.repeat_interleave(hop, dim=1)
 
 
-def min_response(coeffs: torch.Tensor, n_fft: int = 512) -> torch.Tensor:
+def fir_frames(signal: torch.Tensor, taps: torch.Tensor) -> torch.Tensor:
+    """
+    Time-varying FIR filter ``y[n] = sum_k taps[n, k] * signal[n - k]`` (zero initial state).
+
+    Args:
+        signal: (B, T).
+        taps: Per-sample taps (B, T, K), e.g. frame taps held by :func:`frames_to_samples`.
+
+    Returns:
+        (B, T) at the promoted dtype of the inputs.
+    """
+    dtype = torch.promote_types(signal.dtype, taps.dtype)
+    num_taps = taps.shape[-1]
+    padded = torch.nn.functional.pad(signal.to(dtype), (num_taps - 1, 0))
+    history = padded.unfold(-1, num_taps, 1).flip(-1)  # (B, T, K): signal[n - k]
+    return (history * taps.to(dtype)).sum(-1)
+
+
+def min_response(
+    coeffs: torch.Tensor, n_fft: int = 512, numerator: Optional[torch.Tensor] = None
+) -> torch.Tensor:
     """
     Minimum of ``|A(e^{jw})|`` over an ``n_fft``-point frequency grid.
 
@@ -101,20 +121,30 @@ def min_response(coeffs: torch.Tensor, n_fft: int = 512) -> torch.Tensor:
     gradient bounded: d(1/x)/dx = -1/x**2 overflows float32 for sharp
     resonances where x ~ 1e-7.
 
+    With a ``numerator`` N (pole-zero filter N/A), returns ``min |A| / |N|``,
+    again the reciprocal of the peak gain. The minimum sits at a resonance
+    peak, where |N| is far from 0, so the clamp below never shapes the result.
+
     Args:
         coeffs: LPC coefficients of shape (..., order), ``1 - sum`` convention.
         n_fft: Frequency-grid size; must exceed ``order``.
+        numerator: Optional FIR numerator coefficients (..., K).
 
     Returns:
         Tensor of shape (...).
     """
     polynomial = torch.cat([torch.ones_like(coeffs[..., :1]), -coeffs], dim=-1)
-    return torch.fft.rfft(polynomial, n=n_fft).abs().min(dim=-1).values
+    response = torch.fft.rfft(polynomial, n=n_fft).abs()
+    if numerator is not None:
+        response = response / torch.fft.rfft(numerator, n=n_fft).abs().clamp_min(1e-12)
+    return response.min(dim=-1).values
 
 
-def peak_gain(coeffs: torch.Tensor, n_fft: int = 512) -> torch.Tensor:
-    """Peak magnitude response ``1 / min_w |A(e^{jw})|`` of the all-pole filter (for reporting)."""
-    return 1.0 / min_response(coeffs, n_fft).clamp_min(1e-12)
+def peak_gain(
+    coeffs: torch.Tensor, n_fft: int = 512, numerator: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """Peak magnitude response of the all-pole (or pole-zero) filter (for reporting)."""
+    return 1.0 / min_response(coeffs, n_fft, numerator).clamp_min(1e-12)
 
 
 class LPCFilter(nn.Module):
