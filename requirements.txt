@@ -1,13 +1,16 @@
-torch>=2.1
+# Versions tested together (Python 3.10, CPU). Install with
+#   pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt
+# for the CPU build of torch (or drop the extra index for the default CUDA build).
+torch==2.14.1
 torchlpc==0.7.2  # needs python3-dev headers to build its C++ extension
-numpy
-scipy
-soundfile
-numba            # reference engine (vocaltract.reference); optional but ~100x faster
-praat-parselmouth  # analysis/resynthesis (vocaltract.analysis)
-matplotlib       # analysis plots
-openai-whisper   # intelligibility metric (Whisper WER)
-jiwer
-pystoi
-pytest
-tqdm
+numpy==2.2.6
+scipy==1.15.3
+soundfile==0.14.0
+numba==0.68.0              # reference engine (vocaltract.reference); optional but ~100x faster
+praat-parselmouth==0.4.7   # analysis/resynthesis (vocaltract.analysis)
+matplotlib==3.10.9         # analysis plots
+openai-whisper==20250625   # intelligibility metric (Whisper WER)
+jiwer==4.0.0
+pystoi==0.4.1
+pytest==9.1.1
+tqdm==4.70.1

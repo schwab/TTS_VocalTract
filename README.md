@@ -34,7 +34,7 @@ Text / Audio
          │  13-parameter frame @ 50 Hz
          ▼
 ┌─────────────────┐
-│ Parameter → LPC │   small MLP
+│ Parameter → LPC │   one resonator per formant (f1–f4)
 │    Mapper       │
 └────────┬────────┘
          │  time-varying LPC coefficients
@@ -56,26 +56,30 @@ Text / Audio
 | Component | Role | Implementation |
 |---|---|---|
 | **Encoder** | Maps audio (or text) to the 13-parameter frame | CNN or Transformer |
-| **Parameter Mapper** | Converts semantic parameters → LPC coefficients | Small MLP, outputs reflection coefficients for stability |
+| **Parameter Mapper** | Converts semantic parameters → LPC coefficients | `FormantToLPC`: a pole pair at each of f1–f4 with learned bandwidths, plus learned tilt poles (`ParamToLPC`, the original MLP, is still available) |
 | **LPC Filter** | Time-varying all-pole vocal tract model | `torchlpc.sample_wise_lpc` |
-| **Source Model** | Glottal pulse + aspiration noise | Differentiable wavetable / LF-model glottal flow |
+| **Source Model** | Glottal pulse + aspiration noise | VocalTract's own glottal pulse, rendered at 20 kHz and resampled differentiably to 16 kHz |
 | **Decoder (optional)** | Audio → parameters (for training on real speech) | Inverse of the encoder |
 
 ## The 13-Parameter Frame
 
 Inherited from the original Propeller VocalTract encoding:
 
-| Parameter | Description |
-|---|---|
-| Aspiration amplitude | Breathiness / whisper |
-| Glottal amplitude | Voicing strength |
-| Glottal pitch | Fundamental frequency |
-| F1–F4 | Formant frequencies |
-| Fricative amplitude | Sibilant / fricative energy |
-| Nasal formant | Anti-resonator for nasals |
-| ... | (full table TBD) |
+| Name | Parameter | Description |
+|---|---|---|
+| `aa` | Aspiration amplitude | Breathiness / whisper (enters before the formants) |
+| `ga` | Glottal amplitude | Voicing strength |
+| `gp` | Glottal pitch | Fundamental frequency, log scale: 1/48 octave per unit, 100 = 110 Hz |
+| `vp` | Vibrato pitch | Vibrato depth (`vp`/96 octaves of swing) |
+| `vr` | Vibrato rate | Vibrato frequency (0.0763 Hz per unit) |
+| `f1`–`f4` | Formant frequencies | 19.53 Hz per unit |
+| `na` | Nasal amplitude | Depth of the nasal anti-resonance |
+| `nf` | Nasal frequency | Anti-resonance frequency (19.53 Hz per unit) |
+| `fa` | Frication amplitude | Sibilant / fricative energy (added after the formants) |
+| `ff` | Frication frequency | Centre of the frication noise (39.06 Hz per unit) |
 
-Each frame is emitted at ~50 Hz (20 ms hop), matching the original Propeller update rate.
+Each value is one byte on the Propeller and is normalized to [0, 1] here (`vocaltract.params`). Phase 1
+frames are 20 ms apart (50 Hz).
 
 ## Key Technical Decisions
 
@@ -87,13 +91,20 @@ The original VocalTract uses **CORDIC rotations** for its formant resonators —
 - Preserves the all-pole formant topology
 - Keeps F1–F4 as interpretable poles
 
-### Why "learned mapping" instead of "hard conversion"?
+### Why a formant mapper instead of a learned MLP?
 
-Rather than hand-designing the mapping from the 13 parameters to LPC coefficients, a small MLP learns it. Evidence from **GOLF** (Yu et al.) shows that LPC filters spontaneously learn spectral envelopes aligned with formants — so the network naturally discovers the right structure.
+The original plan was for a small MLP to learn the mapping from the 13 parameters to LPC coefficients, following
+**GOLF** (Yu et al.), where LPC filters learn formant-aligned envelopes. Phase 1 showed that this mapping is not
+identifiable. The MLP fitted the spectrum while the formant parameters drifted away from the truth, and on an
+/a/→/i/ glide it held one compromise vowel. `FormantToLPC` places one resonator at each of f1–f4, as VocalTract
+does, and learns only what the frame doesn't specify: four bandwidths and the spectral tilt. Formant parameters
+are then recoverable from audio (perturbed by ~135 Hz, they return to within ~10–50 Hz).
 
 ### Stability
 
-LPC coefficients can produce unstable filters if unconstrained. The mapper outputs **reflection coefficients** (PARCOR), which are guaranteed stable under the Levinson–Durbin recursion.
+LPC coefficients can produce unstable filters if unconstrained. `FormantToLPC` builds the filter from its poles:
+each bandwidth has a 40 Hz floor and each tilt pole is bounded, so every pole radius stays below 1. (The MLP mapper
+outputs **reflection coefficients** (PARCOR), which are stable under the Levinson–Durbin recursion.)
 
 ## Loss Functions
 
@@ -103,6 +114,47 @@ Training uses a combination of:
 2. **Formant tracking loss** — weakly supervises F1–F4 alignment (using LPC analysis on the synthesized audio)
 3. **Adversarial loss (optional)** — multi-resolution discriminator for perceptual quality
 4. **Parameter reconstruction loss** — when training with a paired encoder/decoder
+
+## Phase 1: Minimal Differentiable LPC Pipeline
+
+Phase 1 is a differentiable model of the VocalTract voice path. 13-parameter frames go through the engine's glottal pulse plus aspiration noise, then one resonator per formant, to 16 kHz audio. Gradients reach every parameter, and a 1 s clip can be fitted by gradient descent on the frames. The full specification and results are in [`Phase_1.md`](Phase_1.md) and [`docs/reviews/phase1_completion_review.md`](docs/reviews/phase1_completion_review.md).
+
+**Install** (Python ≥ 3.10, CPU only; `torchlpc` builds a C++ extension and needs the `python3-dev` headers):
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt
+pip install --no-deps -e .
+pytest -m "not slow"     # ~35 s; `pytest -m slow` adds two full overfit runs (~2 min)
+```
+
+The extra index fetches the CPU build of PyTorch, which is much smaller than the default CUDA build. Leave it out to use a GPU build.
+
+**Run:**
+
+```bash
+python -m vocaltract.phase1.smoke_test     # one forward/backward pass; prints shapes and the gradient norm
+python -m vocaltract.phase1.overfit_demo   # fits assets/phase1 vt_vowel_ah; writes out/phase1_overfit*.wav
+python -m vocaltract.phase1.overfit_demo --target vt_glide_ah_ee --target-mode self   # parameter recovery
+```
+
+The demo targets are in `assets/phase1` (see its README): VocalTract renders, a synthetic vowel and two speech excerpts.
+
+- `--target-mode wav` (the default) fits the WAV, starting from the clip's `.npz` parameters.
+- `--target-mode self` renders the target with the pipeline itself, perturbs the formants, and checks that the fit moves them back toward the truth.
+- `python scripts/overfit_report.py out/` summarises a set of runs: harmonic-level error, plus Whisper WER with `--asr`.
+
+**Status.**
+- On the VocalTract targets, harmonic-level error after fitting is 0.2–0.7 dB below 4 kHz.
+- Self mode recovers formants perturbed by ~135 Hz to within ~10–50 Hz.
+- On real speech the fit plateaus at 4–6 dB.
+
+Known limitations, which Phase 2 addresses:
+- Frication, nasals and vibrato (`fa`, `ff`, `na`, `nf`, `vp`, `vr`) are not modelled yet.
+- Pitch is only learnable locally (within ~6 cents), so every fit starts from given parameters.
+- Real voices are not shaped like VocalTract's pulse.
+
+The glottal source originally planned for Phase 2 already exists: the pipeline uses the engine's own pulse.
 
 ## Reference Engine
 
@@ -173,8 +225,9 @@ above 4 kHz. Zoom in time to analyse a single vowel.
 
 ## Roadmap
 
-- [ ] **Phase 1** — Minimal differentiable LPC pipeline (random audio → params → LPC → reconstruction)
-- [ ] **Phase 2** — Glottal source model (differentiable LF / wavetable)
+- [x] **Phase 1** — Minimal differentiable LPC pipeline (random audio → params → LPC → reconstruction)
+- [ ] **Phase 2** — Glottal source model (differentiable LF / wavetable); proposed rescope: complete source model and
+  utterance fitting, measured by WER (`docs/reviews/phase1_completion_review.md`)
 - [ ] **Phase 3** — Train audio → parameters encoder on real speech
 - [ ] **Phase 4** — Formant tracking loss + interpretability analysis
 - [ ] **Phase 5** — Text → parameters (TTS)
@@ -191,17 +244,8 @@ above 4 kHz. Zoom in time to analyse a single vowel.
 
 ## Status
 
-🚧 **Early design phase.** No working implementation yet. Contributions and discussion welcome.
+🚧 **Phase 1 complete; Phase 2 in planning.** Contributions and discussion welcome.
 
 ## License
 
 TBD
-
----
-
-Want me to adjust anything? A few things I'd want to confirm before you commit:
-
-1. **License** — MIT? Apache 2.0?
-2. **Repo name / branding** — keep "TTS_VocalTract", or something like "NeuralVocalTract"?
-3. **The 13-parameter table** — I left the last few entries as placeholders. If you have the exact parameter list from the original VocalTract, I can fill it in.
-4. **Tone** — I aimed for technical-but-approachable. Want it more academic, or more casual/hacker-style?
