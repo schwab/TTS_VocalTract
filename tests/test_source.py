@@ -255,3 +255,26 @@ class TestVocalTractWaveform:
     def test_unknown_waveform(self):
         with pytest.raises(ValueError):
             harmonics_from_frequency(torch.full((1, 10), 100.0), SR, waveform="square")
+
+
+class TestEngineNoiseLevel:
+    """Aspiration at the engine's level: uniform noise at a quarter of the pulse's peak."""
+
+    def aspiration(self, waveform):
+        from vocaltract.params import PARAM_NAMES
+
+        params = torch.zeros(1, 50, 13)
+        params[..., PARAM_NAMES.index("aa")] = 0.5
+        params[..., PARAM_NAMES.index("gp")] = 0.4
+        return make_excitation(params, hop=320, waveform=waveform,
+                               generator=torch.Generator().manual_seed(0))
+
+    @pytest.mark.parametrize("waveform", ["vocaltract", "vocaltract_aliased"])
+    def test_vocaltract_waveforms_use_engine_level(self, waveform):
+        from vocaltract.source import ENGINE_NOISE_RMS
+
+        assert ENGINE_NOISE_RMS == pytest.approx(0.25 / 3 ** 0.5)
+        assert self.aspiration(waveform).std().item() == pytest.approx(0.5 * ENGINE_NOISE_RMS, rel=0.02)
+
+    def test_sawtooth_keeps_unit_variance_noise(self):
+        assert self.aspiration("sawtooth").std().item() == pytest.approx(0.5, rel=0.02)

@@ -8,7 +8,8 @@ This module produces the signal that drives the LPC filter:
 
 Phase 1 deliberately uses a simple source: a band-limited harmonic series at
 the glottal pitch (``gp``) scaled by the glottal amplitude (``ga``), plus white
-noise scaled by the aspiration amplitude (``aa``). Vibrato, frication and nasal
+noise scaled by the aspiration amplitude (``aa``; for the VocalTract waveforms at
+the engine's aspiration level, see ``ENGINE_NOISE_RMS``). Vibrato, frication and nasal
 parameters are ignored here. Phase 2 replaces the harmonic series with a real
 glottal pulse model.
 
@@ -115,6 +116,16 @@ NYQUIST_TAPER_HZ = 500.0
 
 
 WAVEFORMS = ("sawtooth", "vocaltract", "vocaltract_aliased")
+
+# Aspiration level relative to the glottal pulse in the engine. Both sources
+# share the byte amplitude scale: the pulse is ``sine(ga << 24, .) >> 6`` =
+# ga * 2**16 * g(phi), while aspiration is ``mult(aa << 24, r) >> 8`` =
+# aa * r / 2**17 with r a uniform 32-bit LFSR word, i.e. uniform noise of
+# peak aa * 2**14: a quarter of the pulse's peak. The VocalTract waveforms
+# scale the unit-variance Gaussian noise to that uniform noise's RMS, so
+# ``aa`` and ``ga`` mix as they do in the engine (measured on a level-A
+# utterance: within 0.5 dB; unit-variance noise was 17 dB too loud).
+ENGINE_NOISE_RMS = 0.25 / np.sqrt(3.0)
 
 # Grid used to take the Fourier series of the VocalTract pulse.
 _PULSE_GRID = 1 << 15
@@ -249,5 +260,7 @@ def make_excitation(
     noise = torch.randn(
         voiced.shape, generator=generator, dtype=voiced.dtype, device=voiced.device
     )
+    if waveform != "sawtooth":
+        noise = noise * ENGINE_NOISE_RMS
     return voiced + aa * noise
 

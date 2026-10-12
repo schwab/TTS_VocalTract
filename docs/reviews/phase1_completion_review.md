@@ -90,7 +90,8 @@ VocalTract source model plus whole-utterance fitting, measured by WER**:
 
 ### Steps, in order
 
-**2.1 Utterance fitting and WER harness (first, so every later step is measured).**
+**2.1 Utterance fitting and WER harness (first, so every later step is measured).** *(Done 2026-10-12: see
+`Phase_2.md`. Fit corpus WER 14.2% vs level A 34.5%.)*
 - Fit a whole sentence (about 15 s): optimize in overlapping windows (e.g. 1 s windows, 0.25 s overlap, cross-faded
   on output) so memory stays bounded. Initialize from `vocaltract.analysis.resynth`, which already produces
   per-frame VocalTract parameters for any recording (`<name>_frames.csv`, 9.8 ms hop), resampled onto the

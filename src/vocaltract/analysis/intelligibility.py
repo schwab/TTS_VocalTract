@@ -70,8 +70,17 @@ def normalize(text: str) -> str:
     return _normalizer()(text)
 
 
-def transcribe(audio: np.ndarray, sr: int, model: str = DEFAULT_MODEL) -> str:
-    """Greedy, context-free English transcription of a mono float signal."""
+def transcribe(audio: np.ndarray, sr: int, model: str = DEFAULT_MODEL,
+               beam_size: int | None = None) -> str:
+    """
+    Context-free English transcription of a mono float signal: greedy, or
+    beam search with ``beam_size``.
+
+    Greedy decoding can fail catastrophically on synthetic speech. On one
+    level-A-quality sentence, three aspiration-noise realizations of the same
+    frames scored 86%, 28% and 24% WER, the 86% being 25 dropped words.
+    ``beam_size=5`` scored 24%, 28% and 17%.
+    """
     from scipy import signal
 
     x = np.asarray(audio, dtype=np.float64)
@@ -82,7 +91,7 @@ def transcribe(audio: np.ndarray, sr: int, model: str = DEFAULT_MODEL) -> str:
         x = x * (0.9 / peak)
     result = load_model(model).transcribe(
         x.astype(np.float32), language="en", temperature=0.0,
-        condition_on_previous_text=False, fp16=False)
+        condition_on_previous_text=False, fp16=False, beam_size=beam_size)
     return result["text"].strip()
 
 
@@ -117,8 +126,9 @@ def word_error_rate(reference: str, hypothesis: str) -> WerResult:
                      hypothesis=hypothesis)
 
 
-def score(audio: np.ndarray, sr: int, reference: str, model: str = DEFAULT_MODEL) -> WerResult:
-    return word_error_rate(reference, transcribe(audio, sr, model))
+def score(audio: np.ndarray, sr: int, reference: str, model: str = DEFAULT_MODEL,
+          beam_size: int | None = None) -> WerResult:
+    return word_error_rate(reference, transcribe(audio, sr, model, beam_size))
 
 
 def reference_for(audio_path: Path) -> str | None:

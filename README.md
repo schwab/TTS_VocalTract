@@ -156,6 +156,25 @@ Known limitations, which Phase 2 addresses:
 
 The glottal source originally planned for Phase 2 already exists: the pipeline uses the engine's own pulse.
 
+## Phase 2: Utterance fitting (in progress)
+
+Phase 2 fits whole recorded sentences, starting from the level-A analysis below, and measures intelligibility
+as Whisper WER on the ten-sentence set in `assets/recordings/`. Plan and results: [`Phase_2.md`](Phase_2.md).
+
+```bash
+python -m vocaltract.phase2.harness        # fit all ten sentences; writes out/phase2/report.md
+```
+
+Step 2.1 results (Whisper small.en, beam 5):
+
+| | Level A | Fit |
+|---|---|---|
+| Corpus WER | 34.5% | 14.2% |
+| Median clip | 26% | 7% |
+| Worst clip | 109% | 43% |
+
+The originals score 1%.
+
 ## Reference Engine
 
 `vocaltract.reference` is a bit-faithful, non-differentiable Python port of the original
@@ -244,7 +263,7 @@ above 4 kHz. Zoom in time to analyse a single vowel.
 
 ## Status
 
-🚧 **Phase 1 complete; Phase 2 in planning.** Contributions and discussion welcome.
+🚧 **Phase 1 complete; Phase 2 in progress (step 2.1 done).** Contributions and discussion welcome.
 
 ## License
 
