@@ -434,7 +434,9 @@ frames in view) and the difference vs track 1, with the RMS errors above.
   - A one-line description
   - Install instructions
   - The two commands to run (`smoke_test` and `overfit_demo`)
-  - A short note that Phase 2 will replace the sine excitation with a real glottal model.
+  - A short note that Phase 2 will replace the sine excitation with a real glottal model. *(Superseded: revision 2
+    already uses VocalTract's glottal pulse, so the README notes the remaining limitations and the proposed Phase 2
+    rescope instead.)*
 
 **Expected Output:**
 - README renders correctly on GitHub, commands are copy-pasteable.
@@ -443,12 +445,12 @@ frames in view) and the difference vs track 1, with the RMS errors above.
 
 ## Definition of Done (Phase 1)
 
-- [ ] All nine steps complete.
-- [ ] `pytest -q` passes.
-- [ ] `python -m vocaltract.phase1.smoke_test` exits 0 and prints non-zero gradient norm.
-- [ ] `python -m vocaltract.phase1.overfit_demo` writes `out/phase1_overfit.wav` and loss decreases.
-- [ ] README updated.
-- [ ] `requirements.txt` pinned and installable in a fresh venv.
+- [x] All nine steps complete.
+- [x] `pytest -q` passes.
+- [x] `python -m vocaltract.phase1.smoke_test` exits 0 and prints non-zero gradient norm.
+- [x] `python -m vocaltract.phase1.overfit_demo` writes `out/phase1_overfit.wav` and loss decreases.
+- [x] README updated.
+- [x] `requirements.txt` pinned and installable in a fresh venv.
 
 ---
 

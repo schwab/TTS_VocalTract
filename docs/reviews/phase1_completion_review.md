@@ -58,11 +58,12 @@ developer's checkout.
 
 ## Close before calling Phase 1 done
 
-- [ ] Tick the Definition of Done boxes in `Phase_1.md` and the Phase 1 box in the README roadmap.
-- [ ] Update the README's Phase 1 section to describe the current pipeline. Step 9 of the spec still says
+- [x] Tick the Definition of Done boxes in `Phase_1.md` and the Phase 1 box in the README roadmap.
+- [x] Update the README's Phase 1 section to describe the current pipeline. Step 9 of the spec still says
       "Phase 2 will replace the sine excitation", which is out of date.
-- [ ] Install `requirements.txt` in a fresh venv and run the suite.
-- [ ] Run the 2 slow tests (`pytest -m slow`).
+- [x] Install `requirements.txt` in a fresh venv and run the suite. *(Done 2026-10-11: versions pinned; fast suite
+      265 passed, Whisper test included; smoke test and default overfit demo pass.)*
+- [x] Run the 2 slow tests (`pytest -m slow`). *(2 passed, 108 s.)*
 
 ## Known limitations carried into Phase 2
 
