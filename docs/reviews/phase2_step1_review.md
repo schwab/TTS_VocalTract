@@ -113,3 +113,68 @@ from the start.
 - Judge 2.2 with the engine condition from recommendation 1. A differentiable frication source that the engine
   doesn't reproduce would show the same pattern as above: better pipeline WER, little gain on the engine.
 - Validate (b) against the engine on `vt_seven` and on exported speech fricatives, not only on the pipeline.
+
+## Action items
+
+For the developer agent. Each item says what to change, where, and when it's done. Do P2-1 to P2-3 before reporting
+any 2.2 results. P2-4 to P2-6 can follow.
+
+- [ ] **P2-1: engine condition in the harness.**
+  - *Change:* in `src/vocaltract/phase2/harness.py`, add an `engine` condition to `CONDITIONS`. It exports
+    `result.params` to uint8 engine frames (frication gain folded into `fa`), renders them with
+    `vocaltract.reference`, resamples to 16 kHz and scores once (deterministic).
+  - Put the export in the library, e.g. `vocaltract.phase2.utterance.to_engine_frames`. It can start from
+    `to_engine_frames` in `scripts/engine_export_check.py`.
+  - Save the frames as `<id>_engine_frames.csv` (or `.npz`) and write `<id>_engine.wav`. Add the engine render as
+    a track on the compare page.
+  - In `report.md`, show `engine` in both tables. Change the 2.1 acceptance check and the Phase 2 gate in
+    `Phase_2.md` to use `engine` WER. Keep `fit` (pipeline) as a diagnostic.
+  - *Test:* a fitted-params → engine-frames round trip on a tiny synthetic clip gives uint8 frames of the expected
+    length, and `fa` is scaled by the gain.
+  - *Done when:* `python -m vocaltract.phase2.harness --report-only` (after refits) shows engine WER for every clip.
+    On the current fits it should reproduce about 26% corpus.
+
+- [ ] **P2-2: fit on the engine's frame grid.**
+  - *Change:* add a frame mode to `utterance.fit` in which each parameter frame is one engine frame (9.8 ms; 196
+    samples at the 20 kHz render rate). Upsample with the engine's convention: frame k is reached at (k + 1) · 9.8
+    ms, with a linear ramp from frame k − 1 and from zeros before frame 0, i.e. the `engine_to_grid` trajectory.
+  - Level A's frames then initialize the fit directly, with no `engine_to_grid` resampling. Export is a plain
+    `round(p · 255)`.
+  - *Test:*
+    - with the formant mapper frozen, the pipeline's per-sample parameter trajectory equals the engine's
+      interpolation for the same frames (within 1e-6)
+    - init frames → export reproduces level A's bytes exactly
+  - *Done when:* the "init → engine" condition equals level A's WER exactly (same bytes), and the engine-vs-pipeline
+    WER gap on the fit is re-measured and reported.
+
+- [ ] **P2-3: quantization-aware fitting.**
+  - *Change:* add a `FitConfig.quantize_steps` setting, default 50. For the last N steps, `FrameParams.assemble()`
+    returns `p + (round(p · 255) / 255 − p).detach()` (straight-through). The returned best params are the rounded
+    ones.
+  - *Done when:* exported bytes equal `round(best_params · 255)` without further change. Engine WER is reported with
+    and without quantization on 2 clips (5703, 2094).
+
+- [ ] **P2-4: locate the remaining engine/pipeline mismatch.**
+  - *Change:* write a diagnostic (script or harness flag) that renders the same byte frames through the engine and
+    through the pipeline (frozen mapper, frication track). It reports the per-frame log-spectral difference, split
+    into voiced, fricative/aspirated and fast-transition frames (|Δf1| + |Δf2| above a threshold).
+  - It also renders ablations: Gaussian vs LFSR-like uniform noise, and pitch rounded vs not.
+  - *Done when:* there's a short written finding naming the dominant source of the gap, with numbers. Then either
+    fix the pipeline to match, or add an engine check every N steps that logs engine WER or engine spectral loss.
+
+- [ ] **P2-5: freeze the mapper for speech fits.**
+  - *Change:* set `FitConfig.train_mapper=False` (or `tilt_poles=0`) as the default for utterance fits. Note the
+    measurement in `Phase_2.md`: untrained mapper = same WER (20/2/38% vs 20/3/38% on 5703/2094/198).
+  - *Done when:* the default is changed and the harness reruns with no WER regression on the pipeline.
+
+- [ ] **P2-6: housekeeping.**
+  - Run 600 steps on 5703 and 2094 and report whether engine WER keeps improving: `best_step` was 291–300 on all
+    clips.
+  - Add `level_a_wer_beam5` to `assets/recordings/manifest.json`, or a sentence in its README saying the manifest's
+    figures are greedy.
+
+- [ ] **P2-7 (step 2.2 scope): frication must be engine-exportable.**
+  - If 2.2 uses a noise resonator at `ff`, fix its bandwidth to the engine's jitter-equivalent spread; don't learn
+    it.
+  - Accept 2.2 on the **engine** condition: `vt_seven` high band within 6 dB of the engine render of the fitted
+    bytes, and engine corpus WER improves on P2-2/P2-3.
