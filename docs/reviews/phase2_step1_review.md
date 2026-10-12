@@ -25,7 +25,7 @@ The fit still helps on the engine: corpus 34.5% → 26.2%, and 7 of 10 clips imp
 7127: 25→7%, 6930: 109→81%). But half the gain disappears on export, and by the engine's measure step 2.1's own
 acceptance ("no clip worse than its level A") fails.
 
-Reproduce with `python scripts/engine_export_check.py out/phase2 assets/recordings out/phase2_engine`. Export:
+Reproduce with `python scripts/engine_export_check.py out/phase2 assets/recordings out/phase2_engine`. It reads the harness results in `out/phase2`, so run `python -m vocaltract.phase2.harness` first, or pass another checkout's `out/phase2`. Export:
 - each frame is moved to the engine's frame instants, (k + 1) · 9.8 ms, with the same linear interpolation as
   `engine_to_grid` but in reverse
 - `fa` is multiplied by the learned frication gain (`fa` never clipped)

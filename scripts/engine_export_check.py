@@ -7,9 +7,13 @@ For each clip in a harness output folder (``out/phase2``), the initial and fitte
 everything is rounded to bytes, rendered by ``vocaltract.reference`` and scored with Whisper (beam 5).
 The engine is deterministic, so each render is scored once.
 
+It reads the harness's results, so run ``python -m vocaltract.phase2.harness`` first (about 1.5 h), or point it
+at a checkout that has them.
+
 Usage::
 
     python scripts/engine_export_check.py out/phase2 assets/recordings out/phase2_engine
+    python scripts/engine_export_check.py ../TTS_VocalTract/out/phase2 assets/recordings out/phase2_engine
 """
 
 import json
@@ -35,10 +39,18 @@ def to_engine_frames(params: np.ndarray, hop: int, sr: int, fric_gain: float = 1
 
 
 def main() -> int:
+    if len(sys.argv) != 4:
+        print(__doc__, file=sys.stderr)
+        return 2
     out, rec, dst = (Path(a) for a in sys.argv[1:4])
+    results = sorted(p for p in out.glob("*.json") if (out / f"{p.stem}_params.npz").exists())
+    if not results:
+        print(f"error: no harness results (<id>.json + <id>_params.npz) in {out}; "
+              "run `python -m vocaltract.phase2.harness` first", file=sys.stderr)
+        return 1
     dst.mkdir(parents=True, exist_ok=True)
     rows = []
-    for jp in sorted(out.glob("*.json")):
+    for jp in results:
         r = json.loads(jp.read_text())
         cid = r["id"]
         z = np.load(out / f"{cid}_params.npz")
