@@ -49,6 +49,9 @@ Reproduce with `python scripts/engine_export_check.py out/phase2 assets/recordin
 
 ## Where the gap comes from
 
+> **Update (same day):** finding 2 below doesn't hold up under separate tests. See "Addendum: what the export
+> loses" at the end, which replaces this section's conclusions.
+
 I tested three candidates on the clips with the largest gaps (pipeline WER is the mean of 3 seeds):
 
 | Clip | Pipeline fit | Same frames, **untrained mapper** | **Exported bytes, back through the pipeline** | Exported bytes, engine |
@@ -134,7 +137,8 @@ any 2.2 results. P2-4 to P2-6 can follow.
   - *Done when:* `python -m vocaltract.phase2.harness --report-only` (after refits) shows engine WER for every clip.
     On the current fits it should reproduce about 26% corpus.
 
-- [ ] **P2-2: fit on the engine's frame grid.**
+- [ ] **P2-2: fit on the engine's frame grid.** *(Still worth doing so export is exact, but the addendum shows the
+  grid change alone isn't the main loss. Do P2-8 first.)*
   - *Change:* add a frame mode to `utterance.fit` in which each parameter frame is one engine frame (9.8 ms; 196
     samples at the 20 kHz render rate). Upsample with the engine's convention: frame k is reached at (k + 1) · 9.8
     ms, with a linear ramp from frame k − 1 and from zeros before frame 0, i.e. the `engine_to_grid` trajectory.
@@ -147,7 +151,8 @@ any 2.2 results. P2-4 to P2-6 can follow.
   - *Done when:* the "init → engine" condition equals level A's WER exactly (same bytes), and the engine-vs-pipeline
     WER gap on the fit is re-measured and reported.
 
-- [ ] **P2-3: quantization-aware fitting.**
+- [ ] **P2-3: quantization-aware fitting.** *(Low priority: rounding alone costs nothing measurable; see the
+  addendum.)*
   - *Change:* add a `FitConfig.quantize_steps` setting, default 50. For the last N steps, `FrameParams.assemble()`
     returns `p + (round(p · 255) / 255 − p).detach()` (straight-through). The returned best params are the rounded
     ones.
@@ -178,3 +183,84 @@ any 2.2 results. P2-4 to P2-6 can follow.
     it.
   - Accept 2.2 on the **engine** condition: `vt_seven` high band within 6 dB of the engine render of the fitted
     bytes, and engine corpus WER improves on P2-2/P2-3.
+
+## Addendum: what the export loses (2026-10-12, later)
+
+Follow-up experiments on 5703, 2094 and 8463, rendering the same fitted frames in different ways. Pipeline WER is
+the mean of 3 noise seeds. Engine WER is one decode.
+
+### What it isn't
+
+Each candidate was tested on its own, through the pipeline:
+
+| Perturbation of the fitted frames | 5703 | 2094 | 8463 |
+|---|---|---|---|
+| none (the fit) | 20% | 2% | 2% |
+| rounded to bytes on their own grid | 19% | 2% | 1% |
+| resampled to the 9.8 ms engine instants and back, no rounding | 17% | 4% | 2% |
+| untrained mapper (no tilt, 100 Hz bandwidths) | 20% | 2% | — |
+| formants **ramped** (coefficients held 1 ms instead of 10 ms, like the engine's ramps) | 26% | 0% | 1% |
+
+None of these explains the gap. The earlier "about half is the export round trip" figure (5703: 35%) was one
+combined measurement; tested separately, resampling and rounding are each harmless. With Whisper's spread on a
+36-word clip (single-seed values ranged 14–44% here), I no longer trust that number.
+
+### What it is
+
+1. **On smooth frames, engine and pipeline agree.** Level A's frames through the ramped pipeline score 50/10/28%,
+   against 50/11/29% on the engine. Spectra on identical bytes agree within 1–3 dB per band below 4 kHz.
+2. **The fit's gain sits in frame-to-frame jitter.**
+   - The fit makes f1–f4 zig-zag. The mean frame-to-frame change grows from about 2 bytes (level A) to 7–10 bytes,
+     i.e. 140–200 Hz every 10 ms.
+   - Half of all the change the fit makes is this fast component (it stays after a 50 ms moving average).
+   - It's everywhere: largest in silent and fricative frames, where formants are barely observable (5–6 bytes),
+     and 3–5 bytes in voiced frames.
+   - Removing it loses most of the gain, through the pipeline:
+
+   | | 5703 | 2094 | 8463 |
+   |---|---|---|---|
+   | fit | 20% | 2% | 2% |
+   | fit, 3-frame moving average | 36% | 11% | 9% |
+   | init + only the slow part of the fit's change | 37% | 23% | 4% |
+
+3. **The engine doesn't render that jitter the way the pipeline does.** On identical, ramped trajectories, voice
+   only:
+   - engine 16% vs pipeline 6% on 2094
+   - engine 50% vs pipeline 43% on 5703
+   
+   Yet per-frame levels match (within 0.3 dB in fricative frames) and band spectra match within 1–4 dB, so the
+   difference is in fine detail that these measures don't capture. My leading hypothesis is resonator structure
+   under fast frequency changes:
+   - The engine's CORDIC resonators rotate their state, so a frequency change doesn't change the stored energy.
+   - A direct-form IIR filter's state is reinterpreted when its coefficients change, which modulates amplitude
+     and leaves transients.
+   - So the optimizer may be exploiting direct-form artefacts.
+   
+   That's not proven. Aspiration noise type and the engine's 700 µs parameter stepping are the other suspects.
+
+**In short:** the optimizer found a fragile solution that relies on details of the differentiable model the
+engine doesn't share. The robust part of the improvement is smaller than 14.2% suggests, but it's real: the engine
+corpus WER still improves from 34.5% to 26.2%.
+
+### Revised action items (supersede the priorities above; P2-1 stays first)
+
+- [ ] **P2-8: temporal smoothness on the formant tracks (do right after P2-1).**
+  - *Change:*
+    - Add a penalty on the first or second difference of f1–f4 (and possibly `ga`/`aa`), in bytes per frame, to the
+      utterance loss.
+    - Where formants are unobservable (`ga`, `aa` ≈ 0), tie them to their neighbours (stronger penalty) instead
+      of letting Adam's normalized steps random-walk them.
+  - *Done when:* there's a sweep of the penalty weight on 3 clips (5703, 2094, 8463), reporting pipeline WER,
+    engine WER (P2-1) and mean frame-to-frame formant change. Pick the weight that minimizes **engine** WER. The
+    expectation is that the pipeline–engine gap closes, at some cost in pipeline WER.
+  - It also serves interpretability: 150–200 Hz zig-zags every 10 ms aren't articulation.
+- [ ] **P2-9: engine-faithful resonators under fast changes (if P2-8 doesn't close the gap).**
+  - *Change:* implement the formant sections in the engine's rotation form (a decaying 2-D rotation of the state
+    per sample, frequency from `f`), with parameters stepped every 14 samples (700 µs) at 20 kHz as the engine does.
+    It's differentiable, and stable under interpolation by construction.
+  - *Done when:* engine and pipeline WER on the current (jittery) 2.1 fits agree within a few points.
+- [ ] **P2-10: a less noisy engine measurement.**
+  - The engine render is deterministic but Whisper isn't robust: a single decode is one draw. Score the engine
+    condition over 3 small perturbations (e.g. 0/1/2 ms leading silence, or ±0.1 dB dither) and average, as the
+    pipeline already does with noise seeds.
+  - Report per-clip spread. On ~40-word clips, ±10 points per clip is normal, so judge on corpus WER.
